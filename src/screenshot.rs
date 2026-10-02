@@ -348,11 +348,11 @@ impl Screenshot {
         // Find framebuffer location in memory
         debug!("screenshot: finding address");
         let registered_frame = match &self.mode {
-            ScreenshotMode::Real { device_model, .. } if device_model.is_color() => crate::framebuffer::capture_png(&pid)?,
+            ScreenshotMode::Real { device_model, .. } if device_model.is_color() => crate::framebuffer::capture_image(&pid)?,
             _ => None,
         };
-        let processed_data = if let Some(png) = registered_frame {
-            self.process_png(png, rotated)?
+        let processed_data = if let Some(frame) = registered_frame {
+            self.finish_image(image::DynamicImage::ImageRgba8(frame), rotated)?
         } else {
             anyhow::ensure!(DeviceModel::detect() != DeviceModel::RemarkablePaperProMove,
                 "Paper Pro Move requires the registered framebuffer capture extension");
@@ -622,11 +622,6 @@ impl Screenshot {
         let format = self.raw_framebuffer_format();
         let img = Self::image_from_raw_framebuffer(data, format)?;
         self.finish_image(img, rotated)
-    }
-
-    fn process_png(&self, png_data: Vec<u8>, rotated: Option<bool>) -> Result<Vec<u8>> {
-        let img = image::load_from_memory(&png_data)?;
-        self.finish_image(image::DynamicImage::ImageRgba8(img.into_rgba8()), rotated)
     }
 
     fn finish_image(&self, img: image::DynamicImage, rotated: Option<bool>) -> Result<Vec<u8>> {

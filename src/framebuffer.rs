@@ -1,7 +1,6 @@
 //! Read the registered Paper Pro framebuffer when XOVI is active. UI extensions
 //! change heap layout, so the stock allocator heuristic is not reliable there.
 use anyhow::{ensure, Context, Result};
-use image::ImageEncoder;
 use std::{
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom, Write},
@@ -106,7 +105,9 @@ fn query_config() -> Result<Config> {
     config(std::str::from_utf8(&bytes)?)
 }
 
-pub fn capture_png(pid: &str) -> Result<Option<Vec<u8>>> {
+/// Read the registered frame as visible RGBA pixels. The caller downsamples
+/// it directly; the full-resolution frame is never PNG-encoded.
+pub fn capture_image(pid: &str) -> Result<Option<image::RgbaImage>> {
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
     if !maps.contains("framebuffer-spy.so") {
         return Ok(None);
@@ -128,9 +129,8 @@ pub fn capture_png(pid: &str) -> Result<Option<Vec<u8>>> {
     memory.seek(SeekFrom::Start(address))?;
     memory.read_exact(&mut raw)?;
     let rgba = packed_rgba(&raw, width as usize, stride)?;
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
-    Ok(Some(png))
+    let frame = image::RgbaImage::from_raw(width, height, rgba).context("Framebuffer image size mismatch")?;
+    Ok(Some(frame))
 }
 
 #[cfg(test)]
