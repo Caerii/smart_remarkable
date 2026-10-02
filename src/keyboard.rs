@@ -12,6 +12,12 @@ pub const TABLET_WRITE_BACK_MAX_ESTIMATED_MS: usize = 6_500;
 const ESTIMATED_KEYPRESS_MS: usize = 10;
 const ESTIMATED_STYLE_AND_SYNC_MS: usize = 20;
 
+/// uinput device name. Distinct, so other readers of keyboard input (for
+/// example a co-drawing bridge streaming a Bluetooth keyboard) can recognise
+/// and skip the text this program types. A generic name such as
+/// "Virtual Keyboard" is indistinguishable from a real device.
+pub const VIRTUAL_KEYBOARD_NAME: &str = "smart_remarkable keyboard";
+
 pub struct Keyboard {
     device: Option<VirtualDevice>,
     key_map: HashMap<char, (EvdevKey, bool)>,
@@ -98,7 +104,7 @@ impl Keyboard {
 
         VirtualDevice::builder()
             .unwrap()
-            .name("Virtual Keyboard")
+            .name(VIRTUAL_KEYBOARD_NAME)
             .with_keys(&keys)
             .unwrap()
             .build()
