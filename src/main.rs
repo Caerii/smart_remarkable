@@ -3,35 +3,38 @@ use clap::Parser;
 use dotenv::dotenv;
 use log::info;
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
 use std::time::Duration;
 use tokio::time::sleep;
 
 use smart_remarkable::{
+    answer_ui::{answer_svgs, status_svg, AnswerStatus},
     cancellation::SmartRemarkableCancellation,
     config::Config,
-    coordinator::{self, CoordinatorChannels, ProgressState},
+    coordinator::{self, CoordinatorChannels, ProgressState, WriteBackGuardState},
     device::DeviceModel,
     embedded_assets::load_config,
     image_gen::ImageGen,
     keyboard::Keyboard,
     llm_engine::{anthropic::Anthropic, google::Google, openai::OpenAI, LLMEngine},
     pen::Pen,
+    screenshot::{NormalizedView, Screenshot},
     simulation::SimulationConfig,
     status::SmartRemarkableStatus,
-    touch::{PenTool, Rect, Touch, TriggerCorner, TriggerSource},
-    util::{
-        build_svg_from_lines, fit_lines_to_rect, fit_svg_to_rect, image_to_ink_bitmap, setup_uinput, svg_to_bitmap, upscale_png_b64,
-        write_bitmap_to_file, OptionMap,
-    },
+    touch::{finish_selection_handshake, PenTool, Rect, Touch, TriggerCorner, TriggerSource, WriteBackInputMonitor},
+    util::{fit_svg_to_rect, image_to_ink_bitmap, setup_uinput, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
 };
 
 // Output dimensions remain the same for both devices
 const VIRTUAL_WIDTH: u32 = 768;
 const VIRTUAL_HEIGHT: u32 = 1024;
+const SUPERVISED_PROCESSING_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Serialize)]
 #[command(author, version)]
@@ -41,18 +44,17 @@ const VIRTUAL_HEIGHT: u32 = 1024;
 )]
 #[command(after_help = "See https://github.com/yangg1224/smart_remarkable for updates!")]
 pub struct Args {
-    /// Sets the engine to use (openai, anthropic);
+    /// Sets the engine to use (openai, openclaw, anthropic, google);
     /// Sometimes we can guess the engine from the model name
     #[arg(long)]
     engine: Option<String>,
 
     /// Sets the base URL for the engine API;
-    /// Or use environment variable OPENAI_BASE_URL or ANTHROPIC_BASE_URL
+    /// Or use the engine-specific base URL environment variable
     #[arg(long)]
     engine_base_url: Option<String>,
 
-    /// Sets the API key for the engine;
-    /// Or use environment variable OPENAI_API_KEY or ANTHROPIC_API_KEY
+    /// Sets the provider API key or narrow OpenClaw bridge token for the engine
     #[arg(long)]
     engine_api_key: Option<String>,
 
@@ -151,9 +153,30 @@ pub struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Sets which corner the touch trigger listens to (UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left)
+    /// Sets the touch trigger (UR, UL, LR, LL, four-finger, pen-release, or pen-hold)
     #[arg(long, default_value = "UR")]
     trigger_corner: String,
+
+    /// Milliseconds the lasso endpoint must remain still before pen-up in pen-hold mode
+    #[arg(long, default_value_t = 800)]
+    pen_hold_ms: u64,
+
+    /// Allowed endpoint jitter in normalized 768x1024 pixels during a hold
+    #[arg(long, default_value_t = 12)]
+    pen_hold_radius_px: i32,
+
+    /// Minimum normalized path extent accepted as a lasso rather than a tap
+    #[arg(long, default_value_t = 24)]
+    pen_min_extent_px: i32,
+
+    /// Maximum injected pen reports per second (0 = unpaced)
+    #[arg(long, default_value_t = smart_remarkable::pen::DEFAULT_PEN_MAX_RATE)]
+    pen_max_rate: u32,
+
+    /// Hand pen strokes to an external writer instead of writing the pen
+    /// device: "-" for JSON lines on stdout, or a Unix socket path to connect to
+    #[arg(long)]
+    pen_output: Option<String>,
 
     /// Save current configuration to ~/.smart_remarkable.toml and exit
     #[arg(long)]
@@ -166,6 +189,11 @@ pub struct Args {
     /// Port for web server (default: 8080)
     #[arg(long, default_value = "8080")]
     web_port: u16,
+
+    /// Address the web server listens on. The UI has no authentication, so
+    /// the default is loopback; use 0.0.0.0 only on a trusted network.
+    #[arg(long, default_value = "127.0.0.1")]
+    web_bind: std::net::IpAddr,
 
     /// Enable test/simulation mode for specific device (rm2, rmpp)
     #[arg(long)]
@@ -225,6 +253,9 @@ async fn main() -> Result<()> {
         .init();
 
     setup_uinput()?;
+    if smart_remarkable::device::DeviceModel::detect().is_color() {
+        smart_remarkable::preferences::start();
+    }
 
     // Debug commands inject input directly; detect UI rotation first so
     // their coordinates land where the user sees them (best effort — only
@@ -346,6 +377,189 @@ async fn debug_type(spec: &str) -> Result<()> {
     Ok(())
 }
 
+async fn await_processing_while_listener_alive(
+    processing_handle: &mut tokio::task::JoinHandle<Result<coordinator::ProcessingOutcome>>,
+    trigger_handle: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<std::result::Result<Result<coordinator::ProcessingOutcome>, tokio::task::JoinError>> {
+    tokio::select! {
+        // A listener that is already dead must win even when request processing
+        // completed on the same scheduler turn. Otherwise main could briefly
+        // reopen admission and remove busy while /ready still exists.
+        biased;
+        trigger_result = trigger_handle => {
+            let error = match trigger_result {
+                Ok(Ok(())) => anyhow::anyhow!("Trigger listener exited during request processing"),
+                Ok(Err(error)) => error,
+                Err(error) => anyhow::anyhow!(
+                    "Trigger listener task failed during request processing: {}",
+                    error
+                ),
+            };
+            Err(error)
+        }
+        result = processing_handle => Ok(result),
+    }
+}
+
+async fn settle_processing_after_listener_failure<F>(
+    processing_handle: &mut tokio::task::JoinHandle<Result<coordinator::ProcessingOutcome>>,
+    cancellation: &SmartRemarkableCancellation,
+    cleanup_timeout: Duration,
+    restore_prepared_selection: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    cancellation.cancel_all();
+    if tokio::time::timeout(cleanup_timeout, &mut *processing_handle)
+        .await
+        .is_err()
+    {
+        // Stop the worker before restoring selection chrome. Otherwise a
+        // synchronous capture step could resume after restoration and close
+        // the selection that we just returned to the user.
+        processing_handle.abort();
+        let _ = processing_handle.await;
+    }
+
+    // The QML restore chord is deliberately idempotent: it restores a live
+    // Prepared transaction and is a no-op once Closed. Issuing it after the
+    // processing task has settled covers both cooperative and forced cleanup.
+    restore_prepared_selection()
+}
+
+#[cfg(test)]
+mod write_back_safety_tests {
+    use std::cell::Cell;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    use super::{
+        after_successful_activation, await_processing_while_listener_alive,
+        guarded_text_target, settle_processing_after_listener_failure,
+    };
+    use smart_remarkable::cancellation::SmartRemarkableCancellation;
+    use smart_remarkable::coordinator::ProcessingOutcome;
+    use smart_remarkable::touch::Rect;
+
+    #[test]
+    fn text_activation_failure_suppresses_keyboard_output() {
+        let wrote = Cell::new(false);
+        let result = after_successful_activation(Err(anyhow::anyhow!("text tool unavailable")), || {
+            wrote.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!wrote.get());
+
+        let result = after_successful_activation(Ok(()), || {
+            wrote.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(wrote.get());
+    }
+
+    #[test]
+    fn left_edge_placement_moves_the_cursor_target_clear_of_stock_chrome() {
+        let ((tap_x, tap_y), cursor) = guarded_text_target(Rect {
+            x: 10,
+            y: 10,
+            w: 400,
+            h: 300,
+        })
+        .unwrap();
+        assert!(tap_x >= 104);
+        assert!(tap_y >= 120);
+        assert!(cursor.x >= 10);
+        assert!(cursor.y >= 10);
+        assert!(cursor.x + cursor.w <= 410);
+        assert!(cursor.y + cursor.h <= 310);
+        assert!(
+            cursor.x >= super::WRITE_BACK_TOOL_CHROME.x + super::WRITE_BACK_TOOL_CHROME.w
+                || cursor.y >= super::WRITE_BACK_TOOL_CHROME.y + super::WRITE_BACK_TOOL_CHROME.h
+        );
+    }
+
+    #[test]
+    fn placement_too_small_to_clear_stock_chrome_is_rejected() {
+        assert!(guarded_text_target(Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 80,
+        })
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn dead_listener_wins_when_processing_and_listener_are_both_ready() {
+        let mut processing = tokio::spawn(async {
+            Ok::<ProcessingOutcome, anyhow::Error>(ProcessingOutcome::Completed)
+        });
+        let mut trigger = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+        while !processing.is_finished() || !trigger.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let error = await_processing_while_listener_alive(&mut processing, &mut trigger)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Trigger listener exited during request processing"));
+    }
+
+    #[tokio::test]
+    async fn listener_failure_settles_and_restores_a_live_prepared_transaction() {
+        let cancellation = SmartRemarkableCancellation::new();
+        let main_token = cancellation.main_token();
+        let task_cleaned_up = Arc::new(AtomicBool::new(false));
+        let prepared = Arc::new(AtomicBool::new(true));
+        let task_cleaned_up_for_worker = Arc::clone(&task_cleaned_up);
+
+        let mut processing = tokio::spawn(async move {
+            main_token.cancelled().await;
+            task_cleaned_up_for_worker.store(true, Ordering::Release);
+            Ok::<ProcessingOutcome, anyhow::Error>(ProcessingOutcome::Completed)
+        });
+        let mut trigger = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("listener failed while selection was prepared"))
+        });
+
+        let listener_error = await_processing_while_listener_alive(
+            &mut processing,
+            &mut trigger,
+        )
+        .await
+        .unwrap_err();
+        assert!(listener_error.to_string().contains("listener failed"));
+
+        let prepared_for_restore = Arc::clone(&prepared);
+        settle_processing_after_listener_failure(
+            &mut processing,
+            &cancellation,
+            Duration::from_secs(1),
+            || {
+                assert!(
+                    task_cleaned_up.load(Ordering::Acquire),
+                    "processing must stop before selection chrome is restored"
+                );
+                prepared_for_restore.store(false, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(cancellation.should_cancel_main());
+        assert!(!prepared.load(Ordering::Acquire));
+    }
+}
+
 macro_rules! shared {
     ($x:expr) => {
         Arc::new(Mutex::new($x))
@@ -364,6 +578,83 @@ fn draw_text(text: &str, keyboard: &mut Keyboard) -> Result<()> {
     keyboard.key_cmd_body()?;
     keyboard.string_to_keypresses(text)?;
     Ok(())
+}
+
+fn draw_text_guarded(text: &str, keyboard: &mut Keyboard, input_monitor: &mut WriteBackInputMonitor) -> Result<()> {
+    info!("Drawing guarded text to the screen.");
+    keyboard.progress_end()?;
+    keyboard.key_cmd_body_guarded(|| input_monitor.interaction_detected())?;
+    if input_monitor.interaction_detected()? {
+        anyhow::bail!("Physical input changed before response typing");
+    }
+    keyboard.string_to_keypresses_guarded(text, || input_monitor.interaction_detected())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn after_successful_activation<T>(activation: Result<()>, write: impl FnOnce() -> Result<T>) -> Result<T> {
+    activation?;
+    write()
+}
+
+const WRITE_BACK_TOOL_CHROME: Rect = Rect { x: 0, y: 0, w: 80, h: 80 };
+const WRITE_BACK_CURSOR_MIN_CHANGED_PIXELS: usize = 8;
+const WRITE_BACK_CURSOR_MIN_VERTICAL_RUN: usize = 6;
+
+fn guarded_text_target(placement: Rect) -> Option<((i32, i32), Rect)> {
+    let right = placement.x.checked_add(placement.w)?.min(VIRTUAL_WIDTH as i32);
+    let bottom = placement.y.checked_add(placement.h)?.min(VIRTUAL_HEIGHT as i32);
+    let left = placement.x.max(0);
+    let top = placement.y.max(0);
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    // Keep the synthetic placement away from the upper-left palette toggle
+    // and closed-sidebar strip, even when auto-placement begins at x=10.
+    let tap_x = (left + 16).max(104);
+    let tap_y = (top + 16).max(120);
+    if tap_x >= right - 8 || tap_y >= bottom - 8 {
+        return None;
+    }
+
+    // Before typing, only the cursor/text-target UI may differ in this small
+    // region. It is deliberately narrower than the answer-placement box so a
+    // changed page cannot hide behind a broad permitted rectangle.
+    let cursor_left = (tap_x - 4).max(left);
+    let cursor_top = (tap_y - 24).max(top);
+    let cursor_right = (tap_x + 12).min(right);
+    let cursor_bottom = (tap_y + 40).min(bottom);
+    let cursor = Rect {
+        x: cursor_left,
+        y: cursor_top,
+        w: cursor_right - cursor_left,
+        h: cursor_bottom - cursor_top,
+    };
+    (cursor.w > 0 && cursor.h > 0).then_some(((tap_x, tap_y), cursor))
+}
+
+fn take_write_back_view(orientation: Option<smart_remarkable::touch::SelectionOrientation>) -> Result<NormalizedView> {
+    let mut screenshot = Screenshot::new()?;
+    if let Some(orientation) = orientation {
+        screenshot.take_screenshot_with_orientation(orientation)?;
+    } else {
+        screenshot.take_screenshot()?;
+    }
+    let view = screenshot.normalized_view()?;
+    if view.dimensions() != (VIRTUAL_WIDTH, VIRTUAL_HEIGHT) {
+        anyhow::bail!("Write-back screenshot was not normalized to the expected viewport");
+    }
+    Ok(view)
+}
+
+fn write_back_cursor_is_verified(baseline: &NormalizedView, current: &NormalizedView, cursor: Rect) -> bool {
+    baseline.changed_pixels_are_confined(
+        current,
+        &[WRITE_BACK_TOOL_CHROME, cursor],
+        cursor,
+        WRITE_BACK_CURSOR_MIN_CHANGED_PIXELS,
+    ) && baseline.has_vertical_change_run(current, cursor, WRITE_BACK_CURSOR_MIN_VERTICAL_RUN)
 }
 
 fn draw_svg(svg_data: &str, keyboard: &mut Keyboard, pen: &mut Pen, save_bitmap: Option<&String>, no_draw: bool) -> Result<()> {
@@ -402,9 +693,8 @@ fn native_delete_selection(sel: Rect) -> bool {
         return false;
     };
     log::info!("native_delete_selection: tapping delete at {:?}", tap_point);
-    let tapped = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).tap(tap_point).await })
-    });
+    let tapped =
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).tap(tap_point).await }));
     if tapped.is_err() {
         return false;
     }
@@ -442,10 +732,11 @@ fn determine_engine_name(engine_arg: &Option<String>, model: &str) -> Result<Str
 fn create_engine(engine_name: &str, engine_options: &OptionMap) -> Result<Box<dyn LLMEngine>> {
     match engine_name {
         "openai" => Ok(Box::new(OpenAI::new(engine_options))),
+        "openclaw" => Ok(Box::new(OpenAI::new_openclaw(engine_options))),
         "anthropic" => Ok(Box::new(Anthropic::new(engine_options))),
         "google" => Ok(Box::new(Google::new(engine_options))),
         _ => Err(anyhow::anyhow!(
-            "Unknown engine '{}'. Supported engines: openai, anthropic, google",
+            "Unknown engine '{}'. Supported engines: openai, openclaw, anthropic, google",
             engine_name
         )),
     }
@@ -485,7 +776,13 @@ async fn smart_remarkable(args: &Args) -> Result<()> {
             let simulation_config = SimulationConfig::from_config(&config);
             Touch::new_simulated(simulation_config, trigger_corner)?
         } else {
-            Touch::new(config.no_draw, trigger_corner)
+            Touch::new_with_pen_hold(
+                config.no_draw,
+                trigger_corner,
+                config.pen_hold_ms,
+                config.pen_hold_radius_px,
+                config.pen_min_extent_px,
+            )
         };
         Some(Arc::new(TokioRwLock::new(touch)))
     } else {
@@ -508,9 +805,11 @@ async fn smart_remarkable(args: &Args) -> Result<()> {
         let cancellation_clone = Arc::clone(&shared_cancellation);
         let config_watch_tx_clone = Arc::clone(&shared_config_watch_tx);
         let port = args.web_port;
+        let bind = args.web_bind;
 
         Some(tokio::spawn(async move {
             start_web_server(
+                bind,
                 port,
                 config_clone,
                 status_clone,
@@ -547,6 +846,10 @@ async fn smart_remarkable(args: &Args) -> Result<()> {
         .await
         {
             Ok(()) => {
+                if shared_config.read().await.no_loop {
+                    info!("One-shot Smart Remarkable loop exited cleanly");
+                    break Ok(());
+                }
                 info!("Smart Remarkable loop exited normally, restarting to pick up config changes...");
                 continue; // Restart the loop
             }
@@ -586,13 +889,28 @@ async fn run_smart_remarkable_loop(
         config.no_draw_progress,
     ));
 
-    let pen = shared!(Pen::new(config.is_test_mode() || config.no_draw));
+    let pen = shared!(Pen::with_output(
+        config.is_test_mode() || config.no_draw,
+        config.pen_max_rate,
+        config.pen_output.as_deref(),
+    )?);
 
     let touch = if let Some(shared_touch) = shared_touch {
         shared_touch
     } else {
-        Arc::new(TokioRwLock::new(Touch::new(config.no_draw, trigger_corner)))
+        Arc::new(TokioRwLock::new(Touch::new_with_pen_hold(
+            config.no_draw,
+            trigger_corner,
+            config.pen_hold_ms,
+            config.pen_hold_radius_px,
+            config.pen_min_extent_px,
+        )))
     };
+
+    // Only the long-lived listener owns trigger cleanup/readiness. Helper
+    // Touch instances used by drawing tools must never delete a real button
+    // press that arrived during processing.
+    touch.write().await.clear_stale_trigger_state();
 
     // Give keyboard time to initialize
     // sleep(Duration::from_millis(1000)).await;
@@ -637,6 +955,18 @@ async fn run_smart_remarkable_loop(
     // so the image-generation draw tool can attach it to its request when
     // refining an existing sketch
     let input_image_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let answer_marker_slot: Arc<Mutex<Option<Rect>>> = Arc::new(Mutex::new(None));
+    let answer_delivery_result: smart_remarkable::answer_delivery::DeliveryResult = Arc::new(Mutex::new(None));
+    // Explicit async write-back is authorized only while the normalized page
+    // still equals the in-memory post-close view captured for this request.
+    let write_back_view_guard: Arc<Mutex<WriteBackGuardState>> = Arc::new(Mutex::new(WriteBackGuardState::Unrestricted));
+    // One admitted request at a time. The trigger listener also snapshots
+    // this value at pen-down, so a contact begun while busy cannot become a
+    // delayed request after the current response finishes.
+    let trigger_admission = Arc::new(AtomicBool::new(true));
+    // Last successfully processed native selection, used to reject an
+    // accidental repeat of a still-active marquee.
+    let last_selection_fingerprint: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
     // Register tools
     register_tools(
@@ -647,21 +977,40 @@ async fn run_smart_remarkable_loop(
         Arc::clone(&placement_slot),
         Arc::clone(&selection_slot),
         Arc::clone(&input_image_slot),
+        Arc::clone(&answer_marker_slot),
+        Arc::clone(&answer_delivery_result),
+        Arc::clone(&cancellation),
+        Arc::clone(&write_back_view_guard),
         &config,
     )?;
 
     let engine = Arc::new(TokioMutex::new(engine));
 
     // Spawn long-lived tasks
-    let trigger_handle = {
+    // Publish local admission only after every fallible engine/tool setup step
+    // has succeeded, immediately before the listener future takes ownership.
+    let trigger_readiness_guard = touch.write().await.publish_trigger_readiness()?;
+    let mut trigger_handle = {
         let touch = Arc::clone(&touch);
         let trigger_tx = channels.trigger_tx.clone();
         let cancellation = Arc::clone(&cancellation);
         let no_trigger = config.no_trigger;
-        // With the four-finger trigger, the selection comes from the native
-        // selection-tool marquee (detected in the screenshot), not corner taps
-        let collect_taps = config.select_mode && trigger_corner != TriggerCorner::FourFinger;
-        tokio::spawn(async move { coordinator::trigger_task(touch, trigger_tx, cancellation, no_trigger, collect_taps).await })
+        let admission = Arc::clone(&trigger_admission);
+        // Native-selection triggers use the stock marquee detected in the
+        // screenshot, not four follow-up corner taps.
+        let collect_taps = config.select_mode && !matches!(trigger_corner, TriggerCorner::FourFinger | TriggerCorner::PenRelease | TriggerCorner::PenHold);
+        tokio::spawn(async move {
+            coordinator::trigger_task(
+                touch,
+                trigger_tx,
+                cancellation,
+                no_trigger,
+                collect_taps,
+                admission,
+                trigger_readiness_guard,
+            )
+            .await
+        })
     };
 
     let progress_handle = {
@@ -683,6 +1032,17 @@ async fn run_smart_remarkable_loop(
         info!("Main: waiting for next trigger...");
 
         tokio::select! {
+            // Listener death must win over a simultaneously queued trigger.
+            biased;
+            trigger_result = &mut trigger_handle => {
+                cancellation.cancel_all();
+                return match trigger_result {
+                    Ok(Ok(())) => Err(anyhow::anyhow!("Trigger listener exited unexpectedly")),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(anyhow::anyhow!("Trigger listener task failed: {}", error)),
+                };
+            }
+
             Some(trigger_event) = trigger_rx.recv() => {
                 info!("Main: trigger received, starting processing");
 
@@ -690,11 +1050,38 @@ async fn run_smart_remarkable_loop(
                     coordinator::TriggerEvent::UserSelection { selection, placement, .. } => Some((*selection, *placement)),
                     _ => None,
                 };
+                let selection_kind = match &trigger_event {
+                    coordinator::TriggerEvent::UserSelection { selection_kind, .. } => Some(*selection_kind),
+                    _ => None,
+                };
+                let selection_request = match &trigger_event {
+                    coordinator::TriggerEvent::UserSelection {
+                        selection_request,
+                        ..
+                    } => selection_request.clone(),
+                    coordinator::TriggerEvent::UserLegacySelection {
+                        selection_request,
+                        ..
+                    } => Some(selection_request.clone()),
+                    _ => None,
+                };
+                let selection_request_for_cleanup = selection_request.clone();
                 let trigger_source = match &trigger_event {
                     coordinator::TriggerEvent::UserSelection { source, .. } => *source,
+                    coordinator::TriggerEvent::UserLegacySelection { source, .. } => *source,
                     coordinator::TriggerEvent::UserTouch { source } => *source,
                     coordinator::TriggerEvent::WebTrigger => TriggerSource::Touch,
                 };
+
+                if trigger_source == TriggerSource::Settings {
+                    smart_remarkable::preferences::toggle();
+                    continue;
+                }
+                if smart_remarkable::preferences::is_open() {
+                    info!("Ignoring send while settings panel is open");
+                    continue;
+                }
+                if !smart_remarkable::preferences::begin_answer() { continue; }
 
                 // Update progress to indicate we're processing (not waiting for triggers)
                 // let _ = progress_tx.send(ProgressState::TakingScreenshot);
@@ -712,34 +1099,83 @@ async fn run_smart_remarkable_loop(
                 // };
 
                 // Spawn processing task
-                let processing_handle = {
+                let mut processing_handle = {
                     let config_clone = config.clone();
                     let engine_clone = Arc::clone(&engine);
                     let progress_tx_clone = progress_tx.clone();
                     let cancellation_clone = Arc::clone(&cancellation);
+                    let keyboard_clone = Arc::clone(&keyboard);
                     let touch_clone = Arc::clone(&touch);
                     let placement_slot_clone = Arc::clone(&placement_slot);
                     let selection_slot_clone = Arc::clone(&selection_slot);
                     let input_image_slot_clone = Arc::clone(&input_image_slot);
+                    let pen_clone = Arc::clone(&pen);
+                    let answer_marker_slot_clone = Arc::clone(&answer_marker_slot);
+                    let answer_delivery_result_clone = Arc::clone(&answer_delivery_result);
+                    let write_back_view_guard_clone =
+                        Arc::clone(&write_back_view_guard);
+                    let last_selection_fingerprint_clone =
+                        Arc::clone(&last_selection_fingerprint);
                     tokio::spawn(async move {
                         coordinator::processing_task(
                             config_clone,
                             engine_clone,
                             progress_tx_clone,
                             cancellation_clone,
+                            keyboard_clone,
                             touch_clone,
                             selection,
                             placement_slot_clone,
                             selection_slot_clone,
                             input_image_slot_clone,
+                            pen_clone,
+                            answer_marker_slot_clone,
+                            answer_delivery_result_clone,
+                            write_back_view_guard_clone,
                             trigger_source,
+                            selection_kind,
+                            selection_request,
+                            last_selection_fingerprint_clone,
                         ).await
                     })
                 };
 
                 // Wait for either processing to complete or user to cancel
                 // The cancel_monitor will trigger cancellation which processing_task respects
-                let processing_result = processing_handle.await;
+                let processing_result = match await_processing_while_listener_alive(
+                    &mut processing_handle,
+                    &mut trigger_handle,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let keyboard_for_restore = Arc::clone(&keyboard);
+                        if let Err(cleanup_error) = settle_processing_after_listener_failure(
+                            &mut processing_handle,
+                            &cancellation,
+                            SUPERVISED_PROCESSING_CLEANUP_TIMEOUT,
+                            move || {
+                                let mut keyboard = keyboard_for_restore.lock().map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "Unable to restore prepared selection after listener failure: keyboard lock poisoned"
+                                    )
+                                })?;
+                                keyboard.restore_prepared_selection()
+                            },
+                        )
+                        .await
+                        {
+                            return Err(anyhow::anyhow!(
+                                "{}; supervised selection cleanup also failed: {}",
+                                error,
+                                cleanup_error
+                            ));
+                        }
+                        return Err(error);
+                    }
+                };
+                smart_remarkable::preferences::finish_answer();
 
                 // Cancel the cancel monitor (it may still be waiting)
                 cancellation.cancel_execution();
@@ -748,27 +1184,54 @@ async fn run_smart_remarkable_loop(
                 //     cancel_handle
                 // ).await;
 
-                match processing_result {
-                    Ok(Ok(_)) => {
+                let finish_one_shot = match processing_result {
+                    Ok(Ok(coordinator::ProcessingOutcome::Completed)) => {
                         info!("Processing completed successfully, ready for next trigger");
+                        true
+                    }
+                    Ok(Ok(coordinator::ProcessingOutcome::NoSelection)) => {
+                        info!("No native selection yet; keeping the worker armed");
+                        false
+                    }
+                    Ok(Ok(coordinator::ProcessingOutcome::DuplicateSelection)) => {
+                        info!("Still-active selection already processed; keeping the worker armed");
+                        false
                     }
                     Ok(Err(e)) => {
-                        info!("Processing error: {}, ready for next trigger", e);
+                        info!("Processing error: {:#}, ready for next trigger", e);
+                        true
                     }
                     Err(e) => {
                         info!("Processing task join error: {}, ready for next trigger", e);
+                        true
                     }
-                }
+                };
 
-                // Check no_loop mode
-                if config.no_loop {
-                    info!("No-loop mode, exiting");
-                    std::process::exit(0);
-                }
-
+                // A stray pen tap or repeated marquee is not the one-shot
+                // request. Stay armed until a new native selection was
+                // accepted. Real processing errors retain prior behavior.
                 // Drain any triggers that arrived during processing
                 while trigger_rx.try_recv().is_ok() {
                     info!("Ignoring trigger received during processing");
+                }
+                // Reopen in-process admission first. The nonce-bearing busy
+                // file remains present during this transition, so AppLoad
+                // cannot publish a tap that survives into the next idle cycle.
+                trigger_admission.store(true, Ordering::Release);
+                if let Some(request) = &selection_request_for_cleanup {
+                    if let Err(error) = finish_selection_handshake(request) {
+                        cancellation.cancel_all();
+                        return Err(anyhow::anyhow!(
+                            "Unable to release the exact selection handshake; terminating for runner cleanup: {}",
+                            error
+                        ));
+                    }
+                }
+
+                if config.no_loop && finish_one_shot {
+                    info!("No-loop mode, cleaning up and exiting");
+                    cancellation.cancel_all();
+                    break;
                 }
             }
 
@@ -822,6 +1285,10 @@ fn register_tools(
     placement_slot: Arc<Mutex<Option<Rect>>>,
     selection_slot: Arc<Mutex<Option<Rect>>>,
     input_image_slot: Arc<Mutex<Option<String>>>,
+    answer_marker_slot: Arc<Mutex<Option<Rect>>>,
+    answer_delivery_result: smart_remarkable::answer_delivery::DeliveryResult,
+    answer_cancellation: Arc<SmartRemarkableCancellation>,
+    write_back_view_guard: Arc<Mutex<WriteBackGuardState>>,
     config: &Config,
 ) -> Result<()> {
     use serde_json::Value as json;
@@ -832,6 +1299,7 @@ fn register_tools(
     let test_mode = config.is_test_mode();
     let keyboard_clone = Arc::clone(&keyboard);
     let placement_slot_text = Arc::clone(&placement_slot);
+    let write_back_view_guard_text = Arc::clone(&write_back_view_guard);
 
     let tool_config_draw_text = load_config("tool_draw_text.json");
     engine.register_tool(
@@ -851,28 +1319,101 @@ fn register_tools(
                 }
             }
             if !no_draw {
-                // In select mode, the marquee is still active and xochitl
-                // ignores keyboard input. Switch to the text tool and tap the
-                // answer box to place the text cursor before typing.
-                let placement = placement_slot_text.lock().ok().and_then(|mut slot| slot.take());
-                if let Some(rect) = placement {
-                    if !test_mode {
-                        let result = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let mut touch = Touch::new(false, TriggerCorner::UpperRight);
-                                touch.select_text_tool().await?;
-                                touch.tap((rect.x + 10, rect.y + 10)).await?;
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                                Ok::<(), anyhow::Error>(())
-                            })
-                        });
-                        if let Err(e) = result {
-                            log::error!("Failed to activate text tool: {}", e);
-                        }
+                let bounded_for_tablet = match keyboard_clone.lock() {
+                    Ok(keyboard) => keyboard.tablet_write_back_is_bounded(text),
+                    Err(_) => {
+                        log::error!("Keyboard lock is poisoned; skipping tablet insertion");
+                        return;
                     }
+                };
+                if !bounded_for_tablet {
+                    log::info!(
+                        "OpenClaw response exceeds the bounded tablet typing interval or has no supported keys; \
+                         WhatsApp remains canonical and tablet insertion was skipped"
+                    );
+                    return;
                 }
-                if let Err(e) = draw_text(text, &mut lock!(keyboard_clone)) {
-                    log::error!("Failed to draw text: {}", e);
+
+                if test_mode {
+                    if let Err(error) = draw_text(text, &mut lock!(keyboard_clone)) {
+                        log::error!("Failed to type test-mode text: {}", error);
+                    }
+                    return;
+                }
+
+                let guard_state = match write_back_view_guard_text.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        log::error!("Write-back view guard lock is poisoned; skipping tablet insertion");
+                        return;
+                    }
+                };
+                let view_guard = match guard_state {
+                    WriteBackGuardState::Exact(view_guard) => view_guard,
+                    WriteBackGuardState::Unrestricted | WriteBackGuardState::Required => {
+                        log::info!("Write-back requires a verified post-close view; WhatsApp remains canonical and tablet insertion was skipped");
+                        return;
+                    }
+                };
+                let placement = placement_slot_text.lock().ok().and_then(|mut slot| slot.take());
+                let Some(placement) = placement else {
+                    log::error!("Guarded write-back placement is unavailable; skipping tablet insertion");
+                    return;
+                };
+
+                let write_result = {
+                    let current = take_write_back_view(view_guard.orientation);
+                    if !matches!(
+                        current.as_ref(),
+                        Ok(current) if coordinator::write_back_view_matches(&view_guard.baseline, current)
+                    ) {
+                        log::info!(
+                            "Notebook view changed while OpenClaw was working; \
+                             WhatsApp remains canonical and tablet insertion was skipped"
+                        );
+                        return;
+                    }
+                    let Some((tap_point, cursor_region)) = guarded_text_target(placement) else {
+                        log::error!("No toolbar-safe text target fits inside the answer placement; skipping tablet insertion");
+                        return;
+                    };
+
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+                            touch.select_text_tool_with_orientation(view_guard.orientation).await?;
+
+                            // Selecting Text is allowed to change only the
+                            // closed palette toggle. Recheck before placing a
+                            // cursor so a navigation during activation fails.
+                            let after_tool = take_write_back_view(view_guard.orientation)?;
+                            if !view_guard
+                                .baseline
+                                .changed_pixels_are_within(&after_tool, &[WRITE_BACK_TOOL_CHROME])
+                            {
+                                anyhow::bail!("Notebook view changed during text-tool activation");
+                            }
+
+                            touch.tap(tap_point).await?;
+                            drop(touch);
+
+                            // Open only after Smart's physical-evdev injection
+                            // completes, then query all current kernel contact
+                            // state before relying on future events. The narrow
+                            // caret proof below rejects a completed physical
+                            // gesture that moved the target during placement.
+                            let mut input_monitor = WriteBackInputMonitor::start()?;
+                            let target_view = take_write_back_view(view_guard.orientation)?;
+                            if !write_back_cursor_is_verified(&view_guard.baseline, &target_view, cursor_region) {
+                                anyhow::bail!("Text cursor was not verified on the unchanged notebook view");
+                            }
+                            draw_text_guarded(text, &mut lock!(keyboard_clone), &mut input_monitor)
+                        })
+                    })
+                };
+
+                if let Err(error) = write_result {
+                    log::error!("Failed to activate text tool or type guarded text; skipping tablet insertion: {}", error);
                 }
             }
         }),
@@ -929,7 +1470,8 @@ fn register_tools(
                             // rather than slot 2, which may be a highlighter
                             Touch::new(false, TriggerCorner::UpperRight).switch_to_tool(PenTool::Ballpoint).await
                         })
-                    }).unwrap_or(PenTool::Unknown)
+                    })
+                    .unwrap_or(PenTool::Unknown)
                 } else {
                     PenTool::Unknown
                 };
@@ -945,10 +1487,9 @@ fn register_tools(
                 // Restore the original tool after drawing
                 if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
-                        })
-                    }).ok();
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
+                    })
+                    .ok();
                 }
             }
         }
@@ -1041,9 +1582,8 @@ fn register_tools(
 
                 let previous_tool = if !no_draw && !test_mode {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).switch_to_tool(PenTool::Ballpoint).await
-                        })
+                        tokio::runtime::Handle::current()
+                            .block_on(async { Touch::new(false, TriggerCorner::UpperRight).switch_to_tool(PenTool::Ballpoint).await })
                     })
                     .unwrap_or(PenTool::Unknown)
                 } else {
@@ -1060,8 +1600,7 @@ fn register_tools(
 
                 if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
                     })
                     .ok();
                 }
@@ -1111,18 +1650,13 @@ fn register_tools(
                         }
                     }
 
-                    // Only attach the user's sketch when refining a drawing;
-                    // for text selections the prompt alone drives generation.
-                    // Lasso crops are small (a few hundred px) — upscale so
-                    // the image model can actually read the sketch.
-                    let image_input = if redraw_in_place {
-                        input_image.map(|img| upscale_png_b64(&img, 768))
-                    } else {
-                        None
-                    };
-                    let image_bytes = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(image_gen.generate(image_prompt, image_input.as_deref()))
-                    });
+                    // Only attach the user's sketch when refining a drawing.
+                    // Selection preprocessing already normalized and enlarged
+                    // this request-scoped in-memory PNG before it reached the
+                    // slot, so do not resample it a second time.
+                    let image_input = if redraw_in_place { input_image } else { None };
+                    let image_bytes =
+                        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(image_gen.generate(image_prompt, image_input.as_deref())));
                     let image_bytes = match image_bytes {
                         Ok(bytes) => bytes,
                         Err(e) => {
@@ -1170,9 +1704,8 @@ fn register_tools(
 
                     let previous_tool = if !test_mode {
                         tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                Touch::new(false, TriggerCorner::UpperRight).switch_to_tool(PenTool::Ballpoint).await
-                            })
+                            tokio::runtime::Handle::current()
+                                .block_on(async { Touch::new(false, TriggerCorner::UpperRight).switch_to_tool(PenTool::Ballpoint).await })
                         })
                         .unwrap_or(PenTool::Unknown)
                     } else {
@@ -1192,8 +1725,7 @@ fn register_tools(
 
                     if !test_mode && previous_tool != PenTool::Unknown {
                         tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current()
-                                .block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
+                            tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
                         })
                         .ok();
                     }
@@ -1231,20 +1763,32 @@ fn register_tools(
         // draw_answer: structured content, no LLM-computed coordinates. Fixes
         // the garbled/overlapping-text bug caused by relying on the model to
         // do its own line-spacing arithmetic (see prompts/selection.json).
-        // Lines are drawn one at a time with a pause in between, so the
-        // answer appears progressively rather than all at once — both a
-        // nicer effect and visible proof it's still working.
-        const LINE_PAUSE: Duration = Duration::from_millis(450);
+        // Pen strokes already appear progressively. Avoid an additional
+        // artificial delay between lines.
 
         let tool_config_draw_answer = load_config("tool_draw_answer.json");
+        let paginate = serde_json::from_str::<json>(&load_config(&config.prompt))?
+            ["paginate_answer"].as_bool().unwrap_or(false);
         engine.register_tool(
             "draw_answer",
             serde_json::from_str::<serde_json::Value>(tool_config_draw_answer.as_str())?,
             Box::new(move |arguments: json| {
-                let lines: Vec<String> = match arguments["lines"].as_array() {
-                    Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
-                    None => {
+                let lines: Vec<String> = match serde_json::from_value::<Vec<String>>(arguments["lines"].clone()) {
+                    Ok(lines) => lines,
+                    Err(_) => {
                         log::error!("draw_answer tool called without valid 'lines' argument");
+                        if let Ok(mut slot) = answer_delivery_result.lock() {
+                            *slot = Some(Err("Answer contains invalid lines".into()));
+                        }
+                        return;
+                    }
+                };
+
+                let drawings = arguments.get("illustrations").cloned().unwrap_or_else(|| serde_json::json!([]));
+                let drawings = match serde_json::from_value::<Vec<smart_remarkable::illustration::Illustration>>(drawings) {
+                    Ok(drawings) if smart_remarkable::illustration::validate(&drawings).is_ok() => drawings,
+                    _ => {
+                        if let Ok(mut slot) = answer_delivery_result.lock() { *slot = Some(Err("Invalid illustration".into())); }
                         return;
                     }
                 };
@@ -1256,43 +1800,67 @@ fn register_tools(
                 }
 
                 let placement = placement_slot.lock().ok().and_then(|mut slot| slot.take());
-                let line_svgs = match &placement {
-                    Some(rect) => fit_lines_to_rect(&lines, *rect).unwrap_or_else(|e| {
-                        log::error!("Failed to fit lines to placement box: {}, drawing combined", e);
-                        vec![build_svg_from_lines(&lines)]
-                    }),
-                    None => vec![build_svg_from_lines(&lines)],
+                let rect = placement.unwrap_or(Rect { x: 40, y: 80, w: 688, h: 900 });
+                if paginate && !no_draw && !test_mode {
+                    let result = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(
+                        smart_remarkable::answer_delivery::draw_complete_answer(&lines, &drawings, rect, Arc::clone(&pen),
+                            Arc::clone(&answer_marker_slot), Arc::clone(&answer_cancellation))));
+                    if let Err(error) = &result { log::error!("Answer delivery failed: {error:#}"); }
+                    if let Ok(mut slot) = answer_delivery_result.lock() {
+                        *slot = Some(result.map_err(|error| error.to_string()));
+                    }
+                    return;
+                }
+                let mut line_svgs = match answer_svgs(&lines, rect) {
+                    Ok(fragments) => fragments,
+                    Err(error) => {
+                        log::error!("Could not lay out marked answer: {}", error);
+                        return;
+                    }
                 };
+                let pending = answer_marker_slot.lock().ok().and_then(|slot| *slot);
+                if pending != Some(rect) {
+                    line_svgs.insert(0, status_svg(rect, AnswerStatus::Pending).unwrap());
+                }
 
-                let previous_tool = if !no_draw && !test_mode {
+                let previous_tool = if !no_draw && !test_mode && pending != Some(rect) {
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
                             // Use pen slot 1 (the user's own pen, typically black)
                             // rather than slot 2, which may be a highlighter
                             Touch::new(false, TriggerCorner::UpperRight).switch_to_tool(PenTool::Ballpoint).await
                         })
-                    }).unwrap_or(PenTool::Unknown)
+                    })
+                    .unwrap_or(PenTool::Unknown)
                 } else {
                     PenTool::Unknown
                 };
 
+                let mut drawn = true;
                 for (i, svg_data) in line_svgs.iter().enumerate() {
-                    if i > 0 {
-                        std::thread::sleep(LINE_PAUSE);
-                    }
                     let mut keyboard = lock!(keyboard);
                     let mut pen = lock!(pen);
                     if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
                         log::error!("Failed to draw answer line {}: {}", i, e);
+                        drawn = false;
+                        break;
+                    }
+                }
+
+                let state = if drawn { AnswerStatus::Complete } else { AnswerStatus::Failed };
+                if let Ok(svg) = status_svg(rect, state) {
+                    if let Err(error) = draw_svg(&svg, &mut lock!(keyboard), &mut lock!(pen), None, no_draw) {
+                        log::error!("Could not finish answer marker: {}", error);
+                    } else if let Ok(mut slot) = answer_marker_slot.lock() {
+                        slot.take();
                     }
                 }
 
                 if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
-                        })
-                    }).ok();
+                        tokio::runtime::Handle::current().block_on(async { Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await })
+                    })
+                    .ok();
                 }
             }),
         );

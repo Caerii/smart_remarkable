@@ -38,6 +38,19 @@ pub struct Config {
     pub thinking_tokens: u32,
     pub log_level: String,
     pub trigger_corner: String,
+    /// Dwell required before pen-up is accepted by the `pen-hold` trigger.
+    pub pen_hold_ms: u64,
+    /// Maximum endpoint movement, in normalized 768x1024 pixels, that still
+    /// counts as holding the pen still.
+    pub pen_hold_radius_px: i32,
+    /// Reject pen contacts smaller than this normalized extent as taps rather
+    /// than completed native lassos.
+    pub pen_min_extent_px: i32,
+    /// Maximum injected pen SYN reports per second; 0 disables pacing.
+    pub pen_max_rate: u32,
+    /// Hand pen strokes to an external writer ("-" = stdout, else a Unix
+    /// socket path) instead of writing the pen device.
+    pub pen_output: Option<String>,
     // Simulation/test mode options
     pub test_mode: Option<String>,
     pub test_device_model: Option<DeviceModel>,
@@ -76,6 +89,11 @@ impl Default for Config {
             thinking_tokens: 5000,
             log_level: "info".to_string(),
             trigger_corner: "UR".to_string(),
+            pen_hold_ms: 800,
+            pen_hold_radius_px: 12,
+            pen_min_extent_px: 24,
+            pen_max_rate: crate::pen::DEFAULT_PEN_MAX_RATE,
+            pen_output: None,
             // Simulation/test mode defaults
             test_mode: None,
             test_device_model: None,
@@ -129,6 +147,22 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         // Validate trigger corner
         TriggerCorner::from_string(&self.trigger_corner)?;
+
+        if !(400..=3000).contains(&self.pen_hold_ms) {
+            return Err(anyhow::anyhow!(
+                "pen_hold_ms must be between 400 and 3000"
+            ));
+        }
+        if !(4..=48).contains(&self.pen_hold_radius_px) {
+            return Err(anyhow::anyhow!(
+                "pen_hold_radius_px must be between 4 and 48"
+            ));
+        }
+        if !(8..=128).contains(&self.pen_min_extent_px) {
+            return Err(anyhow::anyhow!(
+                "pen_min_extent_px must be between 8 and 128"
+            ));
+        }
 
         // Validate log level
         // match self.log_level.as_str() {

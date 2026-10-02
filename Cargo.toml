@@ -1,6 +1,6 @@
 [package]
 name = "smart_remarkable"
-version = "0.4.0"
+version = "0.8.0-openclaw"
 edition = "2021"
 
 [dependencies]
@@ -13,6 +13,7 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
+libc = "0.2"
 base64 = "0.22"
 image = "0.25.5"
 byteorder = "1.4"
@@ -27,6 +28,7 @@ env_logger = "0.11.6"
 log = "0.4.22"
 figment = { version = "0.10", features = ["toml", "env"] }
 toml = "0.8"
+unicode-normalization = "0.1"
 warp = "0.3"
 
 [dev-dependencies]

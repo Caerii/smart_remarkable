@@ -90,6 +90,14 @@ class GhostwriterConfig {
             }
         });
 
+        // The server never returns API keys; it only reports whether one is set.
+        // Leaving the field blank keeps the configured key.
+        const keyField = document.getElementById('engine_api_key');
+        if (keyField && config.engine_api_key_set) {
+            keyField.value = '';
+            keyField.placeholder = 'Key is set (leave blank to keep it)';
+        }
+
         // Checkboxes
         const boolFields = [
             'no_submit', 'no_draw', 'no_svg', 'no_keyboard', 'no_draw_progress',

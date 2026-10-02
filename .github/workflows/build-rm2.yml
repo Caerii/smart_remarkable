@@ -1,0 +1,56 @@
+# Build Smart Remarkable for the reMarkable 2 (armv7)
+# v1.00 - 2026-08-11 - Damian Jackowski
+#
+# Put this file at .github/workflows/build-rm2.yml in your fork of
+# yangg1224/smart_remarkable, then run it from the Actions tab.
+# It produces a downloadable armv7 binary. No local toolchain needed.
+
+name: Build for reMarkable 2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rm2-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build the release binary
+        run: cross build --release --target=armv7-unknown-linux-gnueabihf
+
+      - name: Report the glibc versions the binary needs
+        run: |
+          BIN=target/armv7-unknown-linux-gnueabihf/release/smart_remarkable
+          file "$BIN"
+          ls -lh "$BIN"
+          echo "Required glibc symbol versions:"
+          readelf --dyn-syms "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV
+          echo "Compare the highest number above with 'ldd --version' on the tablet."
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: smart_remarkable-rm2-armv7
+          path: target/armv7-unknown-linux-gnueabihf/release/smart_remarkable
+          if-no-files-found: error

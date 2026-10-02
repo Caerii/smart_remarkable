@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::device::DeviceModel;
 use crate::embedded_assets::{get_answer_font_data, get_uinput_module_data};
+use crate::llm_engine::SelectionKind;
 
 pub type OptionMap = HashMap<String, String>;
 
@@ -149,47 +150,79 @@ pub fn image_to_ink_bitmap(image_bytes: &[u8], max_dim: u32) -> Result<Vec<Vec<b
     Ok(bitmap)
 }
 
-/// Upscale a small base64 PNG (e.g. a cropped lasso selection of a few
-/// hundred pixels) so the image-generation model gets enough resolution to
-/// read the sketch. Returns the input unchanged if it is already at least
-/// `min_dim` on its longest side, or on any decode error.
-pub fn upscale_png_b64(b64: &str, min_dim: u32) -> String {
+/// Normalize a selected base64 PNG for vision and enlarge small lasso crops.
+///
+/// The stock selection overlay turns the page background gray, so values
+/// above the dark-ink range are restored to white before an aspect-preserving
+/// Lanczos resize. Invalid input is a hard error: a selection must never fall
+/// back to silently sending unprepared or malformed bytes.
+pub fn prepare_selection_png_b64(b64: &str, min_long_edge: u32) -> Result<String> {
+    prepare_selection_png_b64_for_kind(b64, min_long_edge, SelectionKind::Ink)
+}
+
+/// Prepare a native selection according to its stock xochitl classification.
+///
+/// Ink selections include the stock gray selection tint, which is normalized
+/// back to white. Image and mixed selections must retain their color and light
+/// tonal detail, so they are only enlarged (when needed) with an
+/// aspect-preserving bounded resize.
+pub fn prepare_selection_png_b64_for_kind(
+    b64: &str,
+    min_long_edge: u32,
+    kind: SelectionKind,
+) -> Result<String> {
     use base64::prelude::*;
-    let upscaled = || -> Result<String> {
-        let bytes = BASE64_STANDARD.decode(b64)?;
-        let img = image::load_from_memory(&bytes)?;
-        let (w, h) = (img.width(), img.height());
+    if min_long_edge == 0 {
+        anyhow::bail!("selection minimum dimension must be positive");
+    }
+    let bytes = BASE64_STANDARD.decode(b64)?;
+    let img = image::load_from_memory(&bytes)?;
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        anyhow::bail!("selection image is empty");
+    }
 
-        // Whiten the background: the crop of a lassoed region carries the
-        // marquee's gray fill (~rgb 194); the image model reads the sketch
-        // better as black ink on clean white.
-        let mut gray = img.to_luma8();
-        for p in gray.pixels_mut() {
-            if p.0[0] > 150 {
-                p.0[0] = 255;
+    let img = match kind {
+        SelectionKind::Ink => {
+            // The native marquee shades transparent selected paper around
+            // rgb(194). Preserve dark/anti-aliased ink while restoring that
+            // overlay and paper to white.
+            let mut gray = img.to_luma8();
+            for pixel in gray.pixels_mut() {
+                if pixel.0[0] > 150 {
+                    pixel.0[0] = 255;
+                }
             }
+            image::DynamicImage::ImageLuma8(gray)
         }
-        let img = image::DynamicImage::ImageLuma8(gray);
-
-        let resized = if w.max(h) >= min_dim {
-            img
-        } else {
-            let scale = min_dim as f32 / w.max(h) as f32;
-            img.resize(
-                (w as f32 * scale) as u32,
-                (h as f32 * scale) as u32,
-                image::imageops::FilterType::Lanczos3,
-            )
-        };
-        let mut png = std::io::Cursor::new(Vec::new());
-        resized.write_to(&mut png, image::ImageFormat::Png)?;
-        debug!("upscale_png_b64: {}x{} -> {}x{}", w, h, resized.width(), resized.height());
-        Ok(BASE64_STANDARD.encode(png.into_inner()))
+        SelectionKind::Image | SelectionKind::Mixed => {
+            image::DynamicImage::ImageRgba8(img.to_rgba8())
+        }
     };
-    upscaled().unwrap_or_else(|e| {
-        info!("upscale_png_b64 failed ({}), sending original", e);
-        b64.to_string()
-    })
+
+    let prepared = if w.max(h) >= min_long_edge {
+        img
+    } else {
+        let scale = min_long_edge as f64 / w.max(h) as f64;
+        let target_width = ((w as f64 * scale).round() as u32).max(1);
+        let target_height = ((h as f64 * scale).round() as u32).max(1);
+        img.resize_exact(
+            target_width,
+            target_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+    let mut png = std::io::Cursor::new(Vec::new());
+    prepared.write_to(&mut png, image::ImageFormat::Png)?;
+    debug!(
+        "prepare_selection_png_b64: kind={} {}x{} -> {}x{}",
+        kind.as_str(),
+        w,
+        h,
+        prepared.width(),
+        prepared.height()
+    );
+    Ok(BASE64_STANDARD.encode(png.into_inner()))
 }
 
 /// Same as svg_to_bitmap but returns alpha values (0-255) instead of boolean.
@@ -327,8 +360,7 @@ fn xml_escape(s: &str) -> String {
 /// unenforced and can silently produce overlapping/garbled lines when the
 /// model miscounts (see: the "explain option trading" garbled-answer bug).
 ///
-/// Font size/line height shrink for longer answers, so more detail fits
-/// without needing as much vertical page space, while staying legible.
+/// Text origin for the compact answer layout.
 const ANSWER_TEXT_X: u32 = 20;
 
 /// Whether text contains a CJK ideograph. Deliberately narrow (Chinese being
@@ -356,19 +388,13 @@ fn answer_font_family(line: &str) -> &'static str {
     if contains_cjk(line) {
         "Noto Sans SC"
     } else {
-        "Patrick Hand"
+        "IBM Plex Mono"
     }
 }
 
-/// (font_size, line_height) for a given number of answer lines: longer
-/// answers use a smaller size/tighter spacing so they still fit legibly
-/// without needing an ever-taller placement box.
-fn answer_line_layout(n_lines: usize) -> (u32, u32) {
-    if n_lines > 8 {
-        (30, 42)
-    } else {
-        (40, 60)
-    }
+/// Compact, consistent typography; placement may shrink it further to fit.
+fn answer_line_layout(_n_lines: usize) -> (u32, u32) {
+    (22, 31)
 }
 
 pub fn build_svg_from_lines(lines: &[String]) -> String {
@@ -395,26 +421,32 @@ pub fn build_svg_from_lines(lines: &[String]) -> String {
 /// answer appear progressively, like it's being handwritten, instead of all
 /// at once — and doubles as a "still working" signal while it draws.
 pub fn fit_lines_to_rect(lines: &[String], rect: crate::touch::Rect) -> Result<Vec<String>> {
+    Ok(fit_answer_lines(lines, rect, 2.5, true)?.0)
+}
+
+/// Shared layout with an explicit size cap and alignment. Returns the ink height
+/// so an answer's margin marker ends with its text instead of filling empty space.
+pub fn fit_answer_lines(lines: &[String], rect: crate::touch::Rect, max_scale: f32, centered: bool) -> Result<(Vec<String>, f32)> {
     const CANVAS_W: f32 = 768.0;
     const CANVAS_H: f32 = 1024.0;
-    const MAX_UPSCALE: f32 = 2.5;
 
     if lines.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], 0.0));
     }
 
     let combined = build_svg_from_lines(lines);
     let bitmap = svg_to_bitmap(&combined, CANVAS_W as u32, CANVAS_H as u32)?;
     let Some((bbox_x, bbox_y, bbox_w, bbox_h)) = bitmap_ink_bbox(&bitmap) else {
         info!("fit_lines_to_rect: answer has no visible content");
-        return Ok(vec![]);
+        return Ok((vec![], 0.0));
     };
 
     // build_svg_from_lines always emits width="768" height="1024" exactly,
     // so (unlike fit_svg_to_rect, which fits arbitrary LLM-authored SVG)
     // there's no intrinsic-size normalization to apply here.
-    let scale = (rect.w as f32 / bbox_w).min(rect.h as f32 / bbox_h).min(MAX_UPSCALE);
-    let tx = rect.x as f32 - bbox_x * scale + (rect.w as f32 - bbox_w * scale) / 2.0;
+    let scale = (rect.w as f32 / bbox_w).min(rect.h as f32 / bbox_h).min(max_scale);
+    let extra_x = if centered { (rect.w as f32 - bbox_w * scale) / 2.0 } else { 0.0 };
+    let tx = rect.x as f32 - bbox_x * scale + extra_x;
     let ty = rect.y as f32 - bbox_y * scale;
     let tx = tx.clamp(0.0, (CANVAS_W - bbox_w * scale).max(0.0));
     let ty = ty.clamp(0.0, (CANVAS_H - bbox_h * scale).max(0.0));
@@ -436,7 +468,7 @@ pub fn fit_lines_to_rect(lines: &[String], rect: crate::touch::Rect) -> Result<V
     let (font_size, line_height) = answer_line_layout(lines.len());
     let first_y = line_height;
 
-    Ok(lines
+    let fragments = lines
         .iter()
         .enumerate()
         .map(|(i, line)| {
@@ -450,7 +482,8 @@ pub fn fit_lines_to_rect(lines: &[String], rect: crate::touch::Rect) -> Result<V
                 r#"<svg width="768" height="1024" xmlns="http://www.w3.org/2000/svg"><g transform="translate({tx} {ty}) scale({scale} {scale})">{text_el}</g></svg>"#
             )
         })
-        .collect())
+        .collect();
+    Ok((fragments, bbox_h * scale))
 }
 
 pub fn write_bitmap_to_file(bitmap: &[Vec<bool>], filename: &str) -> Result<()> {
@@ -492,6 +525,145 @@ mod tests {
     use super::*;
     use crate::touch::Rect;
 
+    fn encode_gray_png(image: image::GrayImage) -> String {
+        use base64::prelude::*;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        BASE64_STANDARD.encode(png.into_inner())
+    }
+
+    fn encode_rgb_png(image: image::RgbImage) -> String {
+        use base64::prelude::*;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        BASE64_STANDARD.encode(png.into_inner())
+    }
+
+    #[test]
+    fn prepares_small_gray_selection_deterministically() {
+        let mut image =
+            image::GrayImage::from_pixel(300, 52, image::Luma([194]));
+        for x in 40..260 {
+            image.put_pixel(x, 26, image::Luma([0]));
+        }
+        let encoded = encode_gray_png(image);
+
+        let first = prepare_selection_png_b64(&encoded, 768).unwrap();
+        let second = prepare_selection_png_b64(&encoded, 768).unwrap();
+        assert_eq!(first, second);
+
+        use base64::prelude::*;
+        let prepared =
+            image::load_from_memory(&BASE64_STANDARD.decode(first).unwrap())
+                .unwrap()
+                .to_luma8();
+        assert_eq!(prepared.dimensions(), (768, 133));
+        assert_eq!(prepared.get_pixel(0, 0).0[0], 255);
+        assert!(
+            prepared.pixels().any(|pixel| pixel.0[0] < 64),
+            "dark handwriting must survive normalization and scaling"
+        );
+    }
+
+    #[test]
+    fn normalizes_large_selection_without_resizing() {
+        let mut image =
+            image::GrayImage::from_pixel(800, 200, image::Luma([194]));
+        image.put_pixel(400, 100, image::Luma([0]));
+        let prepared =
+            prepare_selection_png_b64(&encode_gray_png(image), 768).unwrap();
+
+        use base64::prelude::*;
+        let decoded = image::load_from_memory(
+            &BASE64_STANDARD.decode(prepared).unwrap(),
+        )
+        .unwrap()
+        .to_luma8();
+        assert_eq!(decoded.dimensions(), (800, 200));
+        assert_eq!(decoded.get_pixel(0, 0).0[0], 255);
+        assert_eq!(decoded.get_pixel(400, 100).0[0], 0);
+    }
+
+    #[test]
+    fn image_selection_preserves_light_color_detail() {
+        let mut image =
+            image::RgbImage::from_pixel(120, 60, image::Rgb([194, 194, 194]));
+        for y in 15..30 {
+            for x in 15..35 {
+                image.put_pixel(x, y, image::Rgb([246, 231, 207]));
+            }
+        }
+        for y in 25..45 {
+            for x in 70..95 {
+                image.put_pixel(x, y, image::Rgb([17, 103, 211]));
+            }
+        }
+
+        let prepared = prepare_selection_png_b64_for_kind(
+            &encode_rgb_png(image),
+            240,
+            SelectionKind::Image,
+        )
+        .unwrap();
+        use base64::prelude::*;
+        let decoded = image::load_from_memory(
+            &BASE64_STANDARD.decode(prepared).unwrap(),
+        )
+        .unwrap()
+        .to_rgb8();
+
+        assert_eq!(decoded.dimensions(), (240, 120));
+        let light = decoded.get_pixel(40, 40).0;
+        assert!(
+            light[0] > light[1] && light[1] > light[2] && light[2] < 250,
+            "light warm detail must not be whitened: {light:?}"
+        );
+        let blue = decoded.get_pixel(160, 70).0;
+        assert!(
+            blue[2] > blue[1] && blue[1] > blue[0],
+            "color relationships must survive resizing: {blue:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_selection_uses_color_preserving_path() {
+        let image =
+            image::RgbImage::from_pixel(800, 200, image::Rgb([194, 160, 120]));
+        let prepared = prepare_selection_png_b64_for_kind(
+            &encode_rgb_png(image),
+            768,
+            SelectionKind::Mixed,
+        )
+        .unwrap();
+        use base64::prelude::*;
+        let decoded = image::load_from_memory(
+            &BASE64_STANDARD.decode(prepared).unwrap(),
+        )
+        .unwrap()
+        .to_rgb8();
+
+        assert_eq!(decoded.dimensions(), (800, 200));
+        assert_eq!(decoded.get_pixel(0, 0).0, [194, 160, 120]);
+    }
+
+    #[test]
+    fn rejects_invalid_selection_image_instead_of_falling_back() {
+        assert!(prepare_selection_png_b64("not-base64", 768).is_err());
+        use base64::prelude::*;
+        let not_an_image = BASE64_STANDARD.encode(b"not a png");
+        assert!(prepare_selection_png_b64(&not_an_image, 768).is_err());
+        assert!(
+            prepare_selection_png_b64(&encode_gray_png(
+                image::GrayImage::new(1, 1),
+            ), 0)
+            .is_err()
+        );
+    }
+
     #[test]
     fn build_svg_from_lines_never_overlaps_regardless_of_model_input() {
         // Regression test for the garbled-answer bug: previously the LLM
@@ -514,20 +686,17 @@ mod tests {
 
         assert_eq!(ys.len(), 8);
         for w in ys.windows(2) {
-            assert_eq!(w[1] - w[0], 60, "line spacing must be exactly 60px, got {:?}", ys);
+            assert_eq!(w[1] - w[0], 31, "line spacing must be exactly 31px, got {:?}", ys);
         }
     }
 
     #[test]
-    fn build_svg_from_lines_shrinks_font_for_long_answers() {
-        // Beyond 8 lines the renderer should switch to the smaller tier
-        // (30px font / 42px spacing) so detailed answers still fit legibly
-        // without needing an ever-taller placement box.
+    fn build_svg_from_lines_keeps_compact_monospaced_size_for_long_answers() {
         let lines: Vec<String> = (0..14).map(|i| format!("point {i}")).collect();
         let svg = build_svg_from_lines(&lines);
 
-        assert!(svg.contains("font-size=\"30\""), "expected smaller font tier for 14 lines");
-        assert!(!svg.contains("font-size=\"40\""));
+        assert!(svg.contains("font-size=\"22\""));
+        assert!(svg.contains("font-family=\"IBM Plex Mono\""));
 
         let ys: Vec<u32> = svg
             .match_indices(" y=\"")
@@ -539,7 +708,7 @@ mod tests {
             .collect();
         assert_eq!(ys.len(), 14);
         for w in ys.windows(2) {
-            assert_eq!(w[1] - w[0], 42, "line spacing must be exactly 42px in the smaller tier, got {:?}", ys);
+            assert_eq!(w[1] - w[0], 31, "line spacing must stay 31px, got {:?}", ys);
         }
     }
 
@@ -634,12 +803,22 @@ mod tests {
     }
 }
 
+fn uinput_module_loading_allowed(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
 pub fn setup_uinput() -> Result<()> {
     debug!("Checking for uinput module");
 
     // Use DeviceModel to detect the device type
     let device_model = DeviceModel::detect();
     info!("Device model detected: {}", device_model.name());
+
+    if device_model == DeviceModel::RemarkablePaperProMove {
+        anyhow::ensure!(std::path::Path::new("/dev/uinput").exists(),
+            "Paper Pro Move requires the firmware's uinput device; Paper Pro kernel modules are incompatible");
+        return Ok(());
+    }
 
     if device_model != DeviceModel::RemarkablePaperPro {
         info!("Not a Paper Pro, skipping uinput module check and installation");
@@ -650,6 +829,16 @@ pub fn setup_uinput() -> Result<()> {
     if std::path::Path::new("/dev/uinput").exists() {
         info!("/dev/uinput exists, kernel has uinput built in, skipping module loading");
         return Ok(());
+    }
+
+    // Loading a kernel module is an explicit opt-in. In particular, never
+    // guess that a module bundled for an older Paper Pro firmware is safe on
+    // the current kernel.
+    let allow_module_load = std::env::var("SMART_REMARKABLE_ALLOW_UINPUT_MODULE_LOAD").ok();
+    if !uinput_module_loading_allowed(allow_module_load.as_deref()) {
+        return Err(anyhow::anyhow!(
+            "/dev/uinput is unavailable and automatic kernel-module loading is disabled"
+        ));
     }
 
     // Check if uinput module is loaded by looking at the lsmod output
@@ -691,7 +880,15 @@ pub fn setup_uinput() -> Result<()> {
 }
 
 #[test]
-fn render_chinese_font_test_png() {
+fn uinput_module_loading_is_fail_closed() {
+    assert!(!uinput_module_loading_allowed(None));
+    assert!(!uinput_module_loading_allowed(Some("0")));
+    assert!(!uinput_module_loading_allowed(Some("true")));
+    assert!(uinput_module_loading_allowed(Some("1")));
+}
+
+#[test]
+fn render_chinese_font_bitmap() {
     // Exercises the real build_svg_from_lines path (system fonts + embedded
     // fonts both loaded, as on the device) to confirm per-line explicit font
     // selection isn't affected by competing system CJK fonts.
@@ -702,12 +899,14 @@ fn render_chinese_font_test_png() {
     ];
     let svg = build_svg_from_lines(&lines);
     let bitmap = svg_to_bitmap(&svg, 768, 1024).unwrap();
-    write_bitmap_to_file(&bitmap, "/private/tmp/claude-501/-Users-yang-Downloads-remarkable-app/8697c15e-ba77-4d86-a32d-4eb6ec49b9f8/scratchpad/chinese_font_test.png").unwrap();
+    assert_eq!(bitmap.len(), 1024);
+    assert!(bitmap.iter().all(|row| row.len() == 768));
+    assert!(bitmap.iter().flatten().any(|&pixel| pixel), "Expected rendered text ink");
 }
 
 #[test]
 fn answer_font_family_picks_chinese_font_for_cjk_lines() {
-    assert_eq!(answer_font_family("Own stock, sell call option"), "Patrick Hand");
+    assert_eq!(answer_font_family("A concise answer"), "IBM Plex Mono");
     assert_eq!(answer_font_family("这是买入并持有股票"), "Noto Sans SC");
     assert_eq!(answer_font_family("Mixed: 卖出call期权 earns 溢价"), "Noto Sans SC");
 }
