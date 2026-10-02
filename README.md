@@ -966,6 +966,10 @@ The upstream **LLM/Draw button** extension (`xovi-ext/llmbutton`) is a
 separate C shared object that resolves private Qt6 symbols with `dlsym` and
 walks the live QtQuick scene graph. It is retained only as upstream source
 and is not compatible with the guarded Paper Pro path.
+Build it for aarch64 with `scripts/build-xovi-ext.sh` (output
+`target/xovi/llmbutton.so`; uses `aarch64-linux-gnu-gcc` or a Debian
+container, and regenerates `xovi.c`/`xovi.h` when `XOVIGEN` points at
+xovigen.py).
 
 The Paper Pro integration instead uses firmware-specific QMLDiff artifacts in
 `xovi-qmd/`. The deployed v3 generation patches the exact `DeviceSceneView.qml` and
