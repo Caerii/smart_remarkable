@@ -173,6 +173,11 @@ pub struct Args {
     #[arg(long, default_value_t = smart_remarkable::pen::DEFAULT_PEN_MAX_RATE)]
     pen_max_rate: u32,
 
+    /// Hand pen strokes to an external writer instead of writing the pen
+    /// device: "-" for JSON lines on stdout, or a Unix socket path to connect to
+    #[arg(long)]
+    pen_output: Option<String>,
+
     /// Save current configuration to ~/.smart_remarkable.toml and exit
     #[arg(long)]
     save_config: bool,
@@ -884,7 +889,11 @@ async fn run_smart_remarkable_loop(
         config.no_draw_progress,
     ));
 
-    let pen = shared!(Pen::with_rate(config.is_test_mode() || config.no_draw, config.pen_max_rate));
+    let pen = shared!(Pen::with_output(
+        config.is_test_mode() || config.no_draw,
+        config.pen_max_rate,
+        config.pen_output.as_deref(),
+    )?);
 
     let touch = if let Some(shared_touch) = shared_touch {
         shared_touch

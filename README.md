@@ -715,6 +715,7 @@ legacy-QMD rollback/migration state described above.
 | `--pen-hold-ms` | `800` | Dwell required at the closed-lasso endpoint in `pen-hold` mode; 400–3000 ms |
 | `--pen-hold-radius-px` | `12` | Maximum normalized endpoint movement before the dwell timer resets; 4–48 px |
 | `--pen-min-extent-px` | `24` | Minimum normalized maximum path extent eligible for lasso submission; 8–128 px |
+| `--pen-output` | off | Hand strokes to another process instead of writing the pen device: `-` for JSON lines on stdout, or a Unix socket path. Lines are `down`/`move`/`up` in digitizer units (see `ExternalWriter` in `src/pen.rs`). Toolbar taps still use the touch device |
 | `--pen-max-rate` | `4000` | Ceiling on injected pen reports per second (`0` = unpaced). Injection also waits until the real pen has been out of range for 500 ms before each stroke |
 | `--apply-segmentation` | off | Add CV-derived spatial hints to the prompt |
 | `--web-search` / `--thinking` / `--thinking-tokens` | off / off / `5000` | Anthropic-only extras |

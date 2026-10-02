@@ -48,6 +48,9 @@ pub struct Config {
     pub pen_min_extent_px: i32,
     /// Maximum injected pen SYN reports per second; 0 disables pacing.
     pub pen_max_rate: u32,
+    /// Hand pen strokes to an external writer ("-" = stdout, else a Unix
+    /// socket path) instead of writing the pen device.
+    pub pen_output: Option<String>,
     // Simulation/test mode options
     pub test_mode: Option<String>,
     pub test_device_model: Option<DeviceModel>,
@@ -90,6 +93,7 @@ impl Default for Config {
             pen_hold_radius_px: 12,
             pen_min_extent_px: 24,
             pen_max_rate: crate::pen::DEFAULT_PEN_MAX_RATE,
+            pen_output: None,
             // Simulation/test mode defaults
             test_mode: None,
             test_device_model: None,

@@ -4,6 +4,8 @@ use evdev::{Device, InputEvent};
 use log::info;
 use resvg::usvg;
 use resvg::usvg::{Options, Tree};
+use serde_json::json;
+use std::io::Write;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -38,6 +40,104 @@ pub struct Pen {
     /// Minimum spacing between injected SYN reports (zero = unpaced).
     report_interval: Duration,
     next_report: Instant,
+    /// When set, strokes go to an external writer instead of the device.
+    external: Option<ExternalWriter>,
+}
+
+/// Hands drawing to another process instead of writing /dev/input.
+///
+/// A program that already owns the pen device (for example a co-drawing
+/// bridge that streams the real pen and must tell injected strokes from
+/// user strokes) can do the writing itself. Each completed SYN report that
+/// changes the stroke becomes one JSON line, in digitizer units:
+///
+/// ```text
+/// {"type":"down","tool":"pen","x":5590,"y":7670,"pressure":2630,"x_max":11180,"y_max":15340}
+/// {"type":"move","x":5600,"y":7672,"pressure":2630}
+/// {"type":"up"}
+/// ```
+///
+/// `tool` is "pen" or "rubber" (erase). Hover-only reports are not sent.
+pub struct ExternalWriter {
+    out: Box<dyn Write + Send>,
+    x_max: i32,
+    y_max: i32,
+    x: i32,
+    y: i32,
+    pressure: i32,
+    rubber: bool,
+    touching: bool,
+    sent_touching: bool,
+    sent_xy: (i32, i32),
+}
+
+impl ExternalWriter {
+    /// `target` is "-" for stdout or the path of a Unix socket to connect to.
+    pub fn connect(target: &str, x_max: i32, y_max: i32) -> Result<Self> {
+        let out: Box<dyn Write + Send> = if target == "-" {
+            Box::new(std::io::stdout())
+        } else {
+            let stream = std::os::unix::net::UnixStream::connect(target)
+                .map_err(|error| anyhow::anyhow!("Cannot connect external pen writer at {}: {}", target, error))?;
+            Box::new(std::io::BufWriter::new(stream))
+        };
+        Ok(Self::new(out, x_max, y_max))
+    }
+
+    fn new(out: Box<dyn Write + Send>, x_max: i32, y_max: i32) -> Self {
+        Self { out, x_max, y_max, x: 0, y: 0, pressure: 0, rubber: false, touching: false, sent_touching: false, sent_xy: (0, 0) }
+    }
+
+    fn write(&mut self, events: &[InputEvent]) -> Result<()> {
+        for event in events {
+            match (event.event_type(), event.code()) {
+                (EvdevEventType::ABSOLUTE, 0) => self.x = event.value(),
+                (EvdevEventType::ABSOLUTE, 1) => self.y = event.value(),
+                (EvdevEventType::ABSOLUTE, 24) => self.pressure = event.value(),
+                (EvdevEventType::KEY, BTN_TOOL_RUBBER) => self.rubber = event.value() != 0,
+                (EvdevEventType::KEY, BTN_TOOL_PEN) if event.value() != 0 => self.rubber = false,
+                (EvdevEventType::KEY, BTN_TOUCH) => self.touching = event.value() != 0,
+                (EvdevEventType::SYNCHRONIZATION, _) => self.report()?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn report(&mut self) -> Result<()> {
+        let line = match (self.sent_touching, self.touching) {
+            (false, true) => json!({
+                "type": "down",
+                "tool": if self.rubber { "rubber" } else { "pen" },
+                "x": self.x,
+                "y": self.y,
+                "pressure": self.pressure,
+                "x_max": self.x_max,
+                "y_max": self.y_max,
+            }),
+            (true, true) if (self.x, self.y) != self.sent_xy => json!({
+                "type": "move",
+                "x": self.x,
+                "y": self.y,
+                "pressure": self.pressure,
+            }),
+            (true, false) => json!({ "type": "up" }),
+            _ => return Ok(()),
+        };
+        writeln!(self.out, "{}", line)?;
+        if !self.touching {
+            self.out.flush()?;
+        }
+        self.sent_touching = self.touching;
+        self.sent_xy = (self.x, self.y);
+        Ok(())
+    }
+}
+
+impl Drop for ExternalWriter {
+    fn drop(&mut self) {
+        let _ = self.out.flush();
+    }
 }
 
 impl Pen {
@@ -64,7 +164,21 @@ impl Pen {
             injecting: false,
             report_interval: Self::report_interval(max_rate),
             next_report: Instant::now(),
+            external: None,
         }
+    }
+
+    /// Like `with_rate`, but with `external_output` set ("-" or a Unix socket
+    /// path) strokes are handed to that writer and the pen device is never
+    /// opened. See `ExternalWriter` for the line format.
+    pub fn with_output(no_draw: bool, max_rate: u32, external_output: Option<&str>) -> Result<Self> {
+        let Some(target) = external_output.filter(|_| !no_draw) else {
+            return Ok(Self::with_rate(no_draw, max_rate));
+        };
+        let mut pen = Self::with_rate(true, max_rate);
+        pen.external = Some(ExternalWriter::connect(target, pen.max_x_value(), pen.max_y_value())?);
+        info!("Pen strokes go to external writer {}", target);
+        Ok(pen)
     }
 
     fn report_interval(max_rate: u32) -> Duration {
@@ -82,6 +196,10 @@ impl Pen {
     /// touching (the events would interleave on one device state machine and
     /// corrupt both strokes), and SYN reports never exceed the rate budget.
     fn emit(&mut self, events: &[InputEvent]) -> Result<()> {
+        if let Some(external) = self.external.as_mut() {
+            // The external writer owns the device, pacing and the real-pen guard.
+            return external.write(events);
+        }
         let Some(device) = self.device.as_mut() else {
             return Ok(());
         };
@@ -936,7 +1054,7 @@ impl Pen {
 mod device_geometry_tests {
     use super::*;
     fn pen_for(device_model: DeviceModel) -> Pen {
-        Pen { device: None, device_model, injecting: false, report_interval: Duration::ZERO, next_report: Instant::now() }
+        Pen { device: None, device_model, injecting: false, report_interval: Duration::ZERO, next_report: Instant::now(), external: None }
     }
 
     #[test]
@@ -958,6 +1076,42 @@ mod device_geometry_tests {
         // Touch alone (the press after a hover) is not a tool transition.
         assert_eq!(Pen::tool_change(&[key(BTN_TOUCH, 1), syn]), None);
         assert_eq!(Pen::tool_change(&[x, syn]), None);
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn external_writer_receives_strokes_instead_of_the_device() {
+        let captured = Captured::default();
+        let mut pen = pen_for(DeviceModel::RemarkablePaperPro);
+        pen.external = Some(ExternalWriter::new(Box::new(captured.clone()), 11180, 15340));
+        pen.pen_down_at((100, 200)).unwrap();
+        pen.goto_xy((110, 210)).unwrap();
+        pen.goto_xy((110, 210)).unwrap(); // no movement: no line
+        pen.pen_up().unwrap();
+        pen.rubber_down_at((5, 6)).unwrap();
+        pen.rubber_up().unwrap();
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                json!({"type": "down", "tool": "pen", "x": 100, "y": 200, "pressure": 2630, "x_max": 11180, "y_max": 15340}),
+                json!({"type": "move", "x": 110, "y": 210, "pressure": 2630}),
+                json!({"type": "up"}),
+                json!({"type": "down", "tool": "rubber", "x": 5, "y": 6, "pressure": 2630, "x_max": 11180, "y_max": 15340}),
+                json!({"type": "up"}),
+            ]
+        );
     }
 
     #[test]
