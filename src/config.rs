@@ -46,6 +46,8 @@ pub struct Config {
     /// Reject pen contacts smaller than this normalized extent as taps rather
     /// than completed native lassos.
     pub pen_min_extent_px: i32,
+    /// Maximum injected pen SYN reports per second; 0 disables pacing.
+    pub pen_max_rate: u32,
     // Simulation/test mode options
     pub test_mode: Option<String>,
     pub test_device_model: Option<DeviceModel>,
@@ -87,6 +89,7 @@ impl Default for Config {
             pen_hold_ms: 800,
             pen_hold_radius_px: 12,
             pen_min_extent_px: 24,
+            pen_max_rate: crate::pen::DEFAULT_PEN_MAX_RATE,
             // Simulation/test mode defaults
             test_mode: None,
             test_device_model: None,

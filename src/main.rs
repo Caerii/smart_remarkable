@@ -169,6 +169,10 @@ pub struct Args {
     #[arg(long, default_value_t = 24)]
     pen_min_extent_px: i32,
 
+    /// Maximum injected pen reports per second (0 = unpaced)
+    #[arg(long, default_value_t = smart_remarkable::pen::DEFAULT_PEN_MAX_RATE)]
+    pen_max_rate: u32,
+
     /// Save current configuration to ~/.smart_remarkable.toml and exit
     #[arg(long)]
     save_config: bool,
@@ -880,7 +884,7 @@ async fn run_smart_remarkable_loop(
         config.no_draw_progress,
     ));
 
-    let pen = shared!(Pen::new(config.is_test_mode() || config.no_draw));
+    let pen = shared!(Pen::with_rate(config.is_test_mode() || config.no_draw, config.pen_max_rate));
 
     let touch = if let Some(shared_touch) = shared_touch {
         shared_touch

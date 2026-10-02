@@ -6,7 +6,7 @@ use resvg::usvg;
 use resvg::usvg::{Options, Tree};
 use std::sync::Arc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::device::DeviceModel;
 use crate::touch::Rect;
@@ -15,13 +15,38 @@ use crate::touch::Rect;
 const VIRTUAL_WIDTH: u32 = 768;
 const VIRTUAL_HEIGHT: u32 = 1024;
 
+// evdev codes used by the injector
+const BTN_TOOL_PEN: u16 = 320;
+const BTN_TOOL_RUBBER: u16 = 321;
+const BTN_TOUCH: u16 = 330;
+
+/// Default ceiling on injected SYN reports per second. Not a measured safe
+/// rate: it only stops unbounded bursts from overrunning xochitl's evdev
+/// client buffer (SYN_DROPPED). 0 disables pacing.
+pub const DEFAULT_PEN_MAX_RATE: u32 = 4000;
+/// Keep waiting this long after the real pen was last in range.
+const REAL_PEN_HOLDOFF: Duration = Duration::from_millis(500);
+/// Give up on a stroke if the real pen never leaves.
+const REAL_PEN_WAIT_LIMIT: Duration = Duration::from_secs(60);
+const REAL_PEN_POLL: Duration = Duration::from_millis(20);
+
 pub struct Pen {
     device: Option<Device>,
     device_model: DeviceModel,
+    /// True between our own tool-in (BTN_TOOL_PEN/RUBBER=1) and tool-out.
+    injecting: bool,
+    /// Minimum spacing between injected SYN reports (zero = unpaced).
+    report_interval: Duration,
+    next_report: Instant,
 }
 
 impl Pen {
     pub fn new(no_draw: bool) -> Self {
+        Self::with_rate(no_draw, DEFAULT_PEN_MAX_RATE)
+    }
+
+    /// `max_rate` caps injected SYN reports per second (0 = unpaced).
+    pub fn with_rate(no_draw: bool, max_rate: u32) -> Self {
         let device_model = DeviceModel::detect();
         info!("Pen using device model: {}", device_model.name());
 
@@ -33,7 +58,102 @@ impl Pen {
 
         let device = if no_draw { None } else { Some(Device::open(pen_input_device).unwrap()) };
 
-        Self { device, device_model }
+        Self {
+            device,
+            device_model,
+            injecting: false,
+            report_interval: Self::report_interval(max_rate),
+            next_report: Instant::now(),
+        }
+    }
+
+    fn report_interval(max_rate: u32) -> Duration {
+        if max_rate == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(1) / max_rate
+        }
+    }
+
+    /// Write one batch of events to the pen device.
+    ///
+    /// Every injected event goes through here so two rules hold everywhere:
+    /// a stroke never starts while the user's real pen is in range or
+    /// touching (the events would interleave on one device state machine and
+    /// corrupt both strokes), and SYN reports never exceed the rate budget.
+    fn emit(&mut self, events: &[InputEvent]) -> Result<()> {
+        let Some(device) = self.device.as_mut() else {
+            return Ok(());
+        };
+        let tool_in = Self::tool_change(events);
+        if tool_in == Some(true) && !self.injecting {
+            Self::wait_for_real_pen_out_of_range(device)?;
+        }
+        if !self.report_interval.is_zero() {
+            let now = Instant::now();
+            if self.next_report > now {
+                let wait = self.next_report - now;
+                // Sleep in >=1 ms slices; finer sleeps cost more than they pace.
+                if wait >= Duration::from_millis(1) {
+                    sleep(wait);
+                }
+            }
+            let reports = events.iter().filter(|event| event.event_type() == EvdevEventType::SYNCHRONIZATION).count() as u32;
+            self.next_report = self.next_report.max(now) + self.report_interval * reports;
+        }
+        device.send_events(events)?;
+        if let Some(tool_in) = tool_in {
+            self.injecting = tool_in;
+        }
+        Ok(())
+    }
+
+    /// The last pen/rubber tool transition in a batch: Some(true) when the
+    /// batch brings our tool into range, Some(false) when it leaves.
+    fn tool_change(events: &[InputEvent]) -> Option<bool> {
+        events
+            .iter()
+            .filter(|event| event.event_type() == EvdevEventType::KEY && matches!(event.code(), BTN_TOOL_PEN | BTN_TOOL_RUBBER))
+            .last()
+            .map(|event| event.value() != 0)
+    }
+
+    /// Block until the real pen has been out of range for REAL_PEN_HOLDOFF.
+    ///
+    /// Injected events update the kernel's key state too, but every injected
+    /// stroke ends with the tool keys released, and the digitizer re-reports
+    /// BTN_TOOL_PEN/BTN_TOUCH on its next frame while the real pen is near.
+    /// So between our strokes a set tool or touch key means the user's pen.
+    fn wait_for_real_pen_out_of_range(device: &Device) -> Result<()> {
+        let started = Instant::now();
+        let mut last_seen: Option<Instant> = None;
+        loop {
+            let keys = device.get_key_state()?;
+            let real_pen_near = [BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH]
+                .iter()
+                .any(|&code| keys.contains(evdev::KeyCode::new(code)));
+            let now = Instant::now();
+            if real_pen_near {
+                if last_seen.is_none() {
+                    info!("Real pen in range; holding injection");
+                }
+                last_seen = Some(now);
+            }
+            match last_seen {
+                None => return Ok(()),
+                Some(seen) if now.duration_since(seen) >= REAL_PEN_HOLDOFF => {
+                    info!("Real pen left range; resuming injection");
+                    return Ok(());
+                }
+                _ => {}
+            }
+            anyhow::ensure!(
+                now.duration_since(started) < REAL_PEN_WAIT_LIMIT,
+                "Real pen stayed in range for {:?}; not injecting",
+                REAL_PEN_WAIT_LIMIT
+            );
+            sleep(REAL_PEN_POLL);
+        }
     }
 
     pub fn draw_line_screen(&mut self, p1: (i32, i32), p2: (i32, i32)) -> Result<()> {
@@ -167,15 +287,13 @@ impl Pen {
     // }
 
     pub fn pen_down(&mut self) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::KEY.0, 320, 1),           // BTN_TOOL_PEN
-                InputEvent::new(EvdevEventType::KEY.0, 330, 1),           // BTN_TOUCH
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 2630),    // ABS_PRESSURE (max pressure)
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),       // ABS_DISTANCE
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-        }
+        self.emit(&[
+            InputEvent::new(EvdevEventType::KEY.0, 320, 1),           // BTN_TOOL_PEN
+            InputEvent::new(EvdevEventType::KEY.0, 330, 1),           // BTN_TOUCH
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 2630),    // ABS_PRESSURE (max pressure)
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),       // ABS_DISTANCE
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
         Ok(())
     }
 
@@ -183,38 +301,34 @@ impl Pen {
     // First hover at the target position (BTN_TOOL_PEN=1, no touch), then press.
     // This pre-positions the pen so there's no snap artifact from a prior position.
     pub fn pen_down_at(&mut self, (x, y): (i32, i32)) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            // Hover far: activate tool at target position from far away (no mark)
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),        // ABS_X
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),        // ABS_Y
-                InputEvent::new(EvdevEventType::KEY.0, 320, 1),           // BTN_TOOL_PEN
-                InputEvent::new(EvdevEventType::KEY.0, 330, 0),           // BTN_TOUCH (not yet)
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),       // ABS_PRESSURE = 0
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),     // ABS_DISTANCE far
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-            // Press: touch down at same position
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::KEY.0, 330, 1),           // BTN_TOUCH
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 2630),    // ABS_PRESSURE (max)
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),       // ABS_DISTANCE = 0
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-        }
+        // Hover far: activate tool at target position from far away (no mark)
+        self.emit(&[
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),        // ABS_X
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),        // ABS_Y
+            InputEvent::new(EvdevEventType::KEY.0, 320, 1),           // BTN_TOOL_PEN
+            InputEvent::new(EvdevEventType::KEY.0, 330, 0),           // BTN_TOUCH (not yet)
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),       // ABS_PRESSURE = 0
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),     // ABS_DISTANCE far
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
+        // Press: touch down at same position
+        self.emit(&[
+            InputEvent::new(EvdevEventType::KEY.0, 330, 1),           // BTN_TOUCH
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 2630),    // ABS_PRESSURE (max)
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),       // ABS_DISTANCE = 0
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
         Ok(())
     }
 
     pub fn pen_up(&mut self) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),       // ABS_PRESSURE
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),     // ABS_DISTANCE
-                InputEvent::new(EvdevEventType::KEY.0, 330, 0),           // BTN_TOUCH
-                InputEvent::new(EvdevEventType::KEY.0, 320, 0),           // BTN_TOOL_PEN
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-        }
+        self.emit(&[
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),       // ABS_PRESSURE
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),     // ABS_DISTANCE
+            InputEvent::new(EvdevEventType::KEY.0, 330, 0),           // BTN_TOUCH
+            InputEvent::new(EvdevEventType::KEY.0, 320, 0),           // BTN_TOOL_PEN
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
         Ok(())
     }
 
@@ -228,36 +342,32 @@ impl Pen {
     // Used to test whether xochitl's eraser needs this signal rather than
     // (or in addition to) the toolbar eraser tool being selected.
     fn rubber_down_at(&mut self, (x, y): (i32, i32)) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),
-                InputEvent::new(EvdevEventType::KEY.0, 321, 1), // BTN_TOOL_RUBBER
-                InputEvent::new(EvdevEventType::KEY.0, 330, 0), // BTN_TOUCH (not yet)
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
-            ])?;
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::KEY.0, 330, 1), // BTN_TOUCH
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 2630),
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
-            ])?;
-        }
+        self.emit(&[
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),
+            InputEvent::new(EvdevEventType::KEY.0, 321, 1), // BTN_TOOL_RUBBER
+            InputEvent::new(EvdevEventType::KEY.0, 330, 0), // BTN_TOUCH (not yet)
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
+        ])?;
+        self.emit(&[
+            InputEvent::new(EvdevEventType::KEY.0, 330, 1), // BTN_TOUCH
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 2630),
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
+        ])?;
         Ok(())
     }
 
     fn rubber_up(&mut self) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),
-                InputEvent::new(EvdevEventType::KEY.0, 330, 0),
-                InputEvent::new(EvdevEventType::KEY.0, 321, 0), // BTN_TOOL_RUBBER off
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
-            ])?;
-        }
+        self.emit(&[
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),
+            InputEvent::new(EvdevEventType::KEY.0, 330, 0),
+            InputEvent::new(EvdevEventType::KEY.0, 321, 0), // BTN_TOOL_RUBBER off
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0),
+        ])?;
         Ok(())
     }
 
@@ -289,13 +399,11 @@ impl Pen {
     }
 
     pub fn goto_xy(&mut self, (x, y): (i32, i32)) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),        // ABS_X
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),        // ABS_Y
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-        }
+        self.emit(&[
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),        // ABS_X
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),        // ABS_Y
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
         Ok(())
     }
 
@@ -628,25 +736,23 @@ impl Pen {
 
     /// Move to position with a specific pressure value (for alpha-pressure rendering).
     fn goto_xy_with_pressure(&mut self, (x, y): (i32, i32), pressure: i32) -> Result<()> {
-        if let Some(device) = &mut self.device {
-            // Hover to position first
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),        // ABS_X
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),        // ABS_Y
-                InputEvent::new(EvdevEventType::KEY.0, 320, 1),           // BTN_TOOL_PEN
-                InputEvent::new(EvdevEventType::KEY.0, 330, 0),           // BTN_TOUCH (not yet)
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),       // ABS_PRESSURE = 0
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),     // ABS_DISTANCE far
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-            // Press with given pressure
-            device.send_events(&[
-                InputEvent::new(EvdevEventType::KEY.0, 330, 1),           // BTN_TOUCH
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, pressure), // ABS_PRESSURE
-                InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),       // ABS_DISTANCE = 0
-                InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
-            ])?;
-        }
+        // Hover to position first
+        self.emit(&[
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, x),        // ABS_X
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 1, y),        // ABS_Y
+            InputEvent::new(EvdevEventType::KEY.0, 320, 1),           // BTN_TOOL_PEN
+            InputEvent::new(EvdevEventType::KEY.0, 330, 0),           // BTN_TOUCH (not yet)
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, 0),       // ABS_PRESSURE = 0
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 100),     // ABS_DISTANCE far
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
+        // Press with given pressure
+        self.emit(&[
+            InputEvent::new(EvdevEventType::KEY.0, 330, 1),           // BTN_TOUCH
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 24, pressure), // ABS_PRESSURE
+            InputEvent::new(EvdevEventType::ABSOLUTE.0, 25, 0),       // ABS_DISTANCE = 0
+            InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0), // SYN_REPORT
+        ])?;
         Ok(())
     }
 
@@ -829,12 +935,34 @@ impl Pen {
 #[cfg(test)]
 mod device_geometry_tests {
     use super::*;
+    fn pen_for(device_model: DeviceModel) -> Pen {
+        Pen { device: None, device_model, injecting: false, report_interval: Duration::ZERO, next_report: Instant::now() }
+    }
+
     #[test]
     fn move_pen_uses_its_own_digitizer_range() {
-        let pen = Pen { device: None, device_model: DeviceModel::RemarkablePaperProMove };
+        let pen = pen_for(DeviceModel::RemarkablePaperProMove);
         assert_eq!((pen.max_x_value(), pen.max_y_value()), (6760, 11960));
         assert_eq!(pen.virtual_to_input((384, 512)), (3380, 5980));
-        let pro = Pen { device: None, device_model: DeviceModel::RemarkablePaperPro };
+        let pro = pen_for(DeviceModel::RemarkablePaperPro);
         assert_eq!((pro.max_x_value(), pro.max_y_value()), (11180, 15340));
+    }
+
+    #[test]
+    fn only_tool_transitions_open_or_close_an_injected_stroke() {
+        let key = |code, value| InputEvent::new(EvdevEventType::KEY.0, code, value);
+        let syn = InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0);
+        let x = InputEvent::new(EvdevEventType::ABSOLUTE.0, 0, 10);
+        assert_eq!(Pen::tool_change(&[x, key(BTN_TOOL_PEN, 1), key(BTN_TOUCH, 0), syn]), Some(true));
+        assert_eq!(Pen::tool_change(&[key(BTN_TOUCH, 0), key(BTN_TOOL_RUBBER, 0), syn]), Some(false));
+        // Touch alone (the press after a hover) is not a tool transition.
+        assert_eq!(Pen::tool_change(&[key(BTN_TOUCH, 1), syn]), None);
+        assert_eq!(Pen::tool_change(&[x, syn]), None);
+    }
+
+    #[test]
+    fn rate_limit_converts_reports_per_second_to_spacing() {
+        assert_eq!(Pen::report_interval(0), Duration::ZERO);
+        assert_eq!(Pen::report_interval(4000), Duration::from_micros(250));
     }
 }
