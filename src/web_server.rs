@@ -17,8 +17,14 @@ const WEB_FILES: &[(&str, &str, &str)] = &[
     ("app.js", include_str!("web/app.js"), "application/javascript"),
 ];
 
-/// Start the web server on the specified port with shared state
+/// Fields that hold secrets. They are never sent to the browser.
+const SECRET_FIELDS: &[&str] = &["engine_api_key", "image_api_key"];
+
+/// Start the web server on the specified address and port with shared state.
+/// The server has no authentication, so callers should bind loopback unless
+/// the operator explicitly asks for another interface.
 pub async fn start_web_server(
+    bind: std::net::IpAddr,
     port: u16,
     shared_config: Arc<TokioRwLock<Config>>,
     shared_status: Arc<TokioRwLock<SmartRemarkableStatus>>,
@@ -26,7 +32,10 @@ pub async fn start_web_server(
     cancellation: Option<Arc<TokioRwLock<crate::cancellation::SmartRemarkableCancellation>>>,
     config_watch_tx: Option<Arc<tokio::sync::watch::Sender<Config>>>,
 ) -> Result<()> {
-    info!("Starting web server on port {}", port);
+    info!("Starting web server on {}:{}", bind, port);
+    if !bind.is_loopback() {
+        warn!("Web server bound to {}: the configuration UI has no authentication", bind);
+    }
 
     // Static file routes
     let static_files = warp::path::end()
@@ -85,9 +94,9 @@ pub async fn start_web_server(
 
     let routes = static_files.or(api_routes).with(cors).recover(handle_rejection);
 
-    info!("Web interface available at http://localhost:{}/", port);
+    info!("Web interface available at http://{}:{}/", bind, port);
 
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    warp::serve(routes).run((bind, port)).await;
 
     Ok(())
 }
@@ -129,7 +138,33 @@ async fn simulation_trigger_handler(trigger_data: Value, shared_touch: Option<Ar
 
 async fn get_config_handler(shared_config: Arc<TokioRwLock<Config>>) -> Result<impl Reply, Rejection> {
     let config = shared_config.read().await;
-    Ok(reply_json(&*config))
+    Ok(reply_json(&redacted_config(&config)))
+}
+
+/// Serialize the config for the browser with every secret replaced by null
+/// and a `<field>_set` flag saying whether one is configured.
+fn redacted_config(config: &Config) -> Value {
+    let mut value = serde_json::to_value(config).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        for field in SECRET_FIELDS {
+            let is_set = object.get(*field).is_some_and(|secret| !secret.is_null());
+            object.insert((*field).to_string(), Value::Null);
+            object.insert(format!("{field}_set"), Value::Bool(is_set));
+        }
+    }
+    value
+}
+
+/// The browser never sees secrets, so a posted config without one keeps the
+/// secret already configured instead of erasing it.
+fn keep_unposted_secrets(mut posted: Config, current: &Config) -> Config {
+    if posted.engine_api_key.is_none() {
+        posted.engine_api_key = current.engine_api_key.clone();
+    }
+    if posted.image_api_key.is_none() {
+        posted.image_api_key = current.image_api_key.clone();
+    }
+    posted
 }
 
 async fn save_config_handler(
@@ -138,6 +173,8 @@ async fn save_config_handler(
     cancellation: Option<Arc<TokioRwLock<crate::cancellation::SmartRemarkableCancellation>>>,
     config_watch_tx: Option<Arc<tokio::sync::watch::Sender<Config>>>,
 ) -> Result<impl Reply, Rejection> {
+    let config = keep_unposted_secrets(config, &*shared_config.read().await);
+
     // Validate the config before saving
     if let Err(e) = config.validate() {
         warn!("Config validation failed: {}", e);
@@ -214,4 +251,34 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
     }));
 
     Ok(with_status(json, code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_reply_never_contains_api_keys() {
+        let config = Config {
+            engine_api_key: Some("sk-engine-secret".into()),
+            image_api_key: None,
+            ..Config::default()
+        };
+        let reply = redacted_config(&config);
+        assert!(!reply.to_string().contains("sk-engine-secret"));
+        assert_eq!(reply["engine_api_key"], Value::Null);
+        assert_eq!(reply["engine_api_key_set"], Value::Bool(true));
+        assert_eq!(reply["image_api_key_set"], Value::Bool(false));
+    }
+
+    #[test]
+    fn posting_a_redacted_config_keeps_existing_keys() {
+        let current = Config { engine_api_key: Some("kept".into()), ..Config::default() };
+        let posted = Config { model: "other".into(), ..Config::default() };
+        let merged = keep_unposted_secrets(posted, &current);
+        assert_eq!(merged.engine_api_key.as_deref(), Some("kept"));
+        assert_eq!(merged.model, "other");
+        let replaced = keep_unposted_secrets(Config { engine_api_key: Some("new".into()), ..Config::default() }, &current);
+        assert_eq!(replaced.engine_api_key.as_deref(), Some("new"));
+    }
 }

@@ -604,8 +604,9 @@ the refined version draws in their place. Needs `GEMINI_API_KEY` or
   synthetic pen/touch coordinates back at the injection boundary — so taps,
   erasing, and drawing land correctly either way you hold the tablet.
 
-- **Web config UI** (`--web-server`, `--web-port`). A `warp`-based HTTP
-  server (default port `8080`) serving a small static UI for viewing and
+- **Web config UI** (`--web-server`, `--web-port`, `--web-bind`). A `warp`-based HTTP
+  server (default `127.0.0.1:8080`; it has no authentication, so pass
+  `--web-bind 0.0.0.0` only on a trusted network) serving a small static UI for viewing and
   live-editing the running config, applying changes immediately (in-memory,
   hot-reloaded via a watch channel, with in-flight LLM calls cancelled) and
   persisting them to `~/.smart_remarkable.toml`. Also exposes
@@ -716,7 +717,7 @@ legacy-QMD rollback/migration state described above.
 | `--pen-min-extent-px` | `24` | Minimum normalized maximum path extent eligible for lasso submission; 8–128 px |
 | `--apply-segmentation` | off | Add CV-derived spatial hints to the prompt |
 | `--web-search` / `--thinking` / `--thinking-tokens` | off / off / `5000` | Anthropic-only extras |
-| `--web-server` / `--web-port` | off / `8080` | Live config UI/API |
+| `--web-server` / `--web-port` / `--web-bind` | off / `8080` / `127.0.0.1` | Live config UI/API; API keys are never returned by `GET /api/config` |
 | `--save-config` | off | Persist resolved config and exit |
 | `--log-level` | `info` | `debug`, `trace`, etc. |
 | `--input-png`, `--test-mode`, `--test-touch-events-file`, `--test-screenshot-dir`, `--test-auto-trigger-delay` | — | Offline simulation / testing |
