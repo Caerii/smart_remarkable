@@ -19,8 +19,12 @@ const RM2_LANDSCAPE_WIDTH: u32 = 1872;
 const RM2_LANDSCAPE_HEIGHT: u32 = 1404;
 const RM2_PORTRAIT_WIDTH: u32 = 1404;
 const RM2_PORTRAIT_HEIGHT: u32 = 1872;
-const RMPP_WIDTH: u32 = 1632;
-const RMPP_HEIGHT: u32 = 2154;
+// Paper Pro scanout: 1620x2160 visible BGRA pixels in rows of 6528 bytes
+// (1632 pixels). Reading it as contiguous 1632x2154 kept the 12 padding
+// columns and dropped the last 6 rows.
+const RMPP_STRIDE_PIXELS: u32 = 1632;
+const RMPP_WIDTH: u32 = 1620;
+const RMPP_HEIGHT: u32 = 2160;
 const RMPP_FRAME_CHAIN_MAX_HOPS: usize = 64;
 const RMPP_PAGE_BYTES: u64 = 4096;
 const RMPP_TERMINAL_ADVANCE_BYTES: u64 = 0x00d73000;
@@ -31,7 +35,7 @@ const FRAMEBUFFER_PROBE_CHUNK_BYTES: usize = 64 * 1024;
 enum RawFramebufferFormat {
     Rm2Rgb565,
     Rm2Bgra32,
-    RmppRgba8,
+    RmppBgra32Padded,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -237,7 +241,9 @@ impl Screenshot {
         };
         match device_model {
             DeviceModel::Remarkable2 => RM2_LANDSCAPE_WIDTH,
-            DeviceModel::RemarkablePaperPro => RMPP_WIDTH,
+            // Raw row width including padding; image_from_raw_framebuffer
+            // crops to the visible RMPP_WIDTH.
+            DeviceModel::RemarkablePaperPro => RMPP_STRIDE_PIXELS,
             DeviceModel::RemarkablePaperProMove => 960,
             DeviceModel::Unknown => RM2_LANDSCAPE_WIDTH, // Default to RM2
         }
@@ -668,7 +674,7 @@ impl Screenshot {
             ScreenshotMode::Simulated { .. } => &DeviceModel::Unknown,
         };
         match device_model {
-            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperProMove => RawFramebufferFormat::RmppRgba8,
+            DeviceModel::RemarkablePaperPro | DeviceModel::RemarkablePaperProMove => RawFramebufferFormat::RmppBgra32Padded,
             _ if self.bytes_per_pixel() == 4 => RawFramebufferFormat::Rm2Bgra32,
             _ => RawFramebufferFormat::Rm2Rgb565,
         }
@@ -678,8 +684,9 @@ impl Screenshot {
     /// the previous raw-PNG encode/decode path produced.
     fn image_from_raw_framebuffer(raw_data: Vec<u8>, format: RawFramebufferFormat) -> Result<image::DynamicImage> {
         match format {
-            RawFramebufferFormat::RmppRgba8 => {
-                let image = image::RgbaImage::from_raw(RMPP_WIDTH, RMPP_HEIGHT, raw_data)
+            RawFramebufferFormat::RmppBgra32Padded => {
+                let rgba = crate::framebuffer::packed_rgba(&raw_data, RMPP_WIDTH as usize, (RMPP_STRIDE_PIXELS * 4) as usize)?;
+                let image = image::RgbaImage::from_raw(RMPP_WIDTH, RMPP_HEIGHT, rgba)
                     .ok_or_else(|| anyhow::anyhow!("Failed to create RMPP image from raw data"))?;
                 Ok(image::DynamicImage::ImageRgba8(image))
             }
@@ -1103,8 +1110,8 @@ mod tests {
         let mut png_data = Vec::new();
         let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
         match format {
-            RawFramebufferFormat::RmppRgba8 => {
-                encoder.write_image(raw_data, RMPP_WIDTH, RMPP_HEIGHT, image::ExtendedColorType::Rgba8).unwrap();
+            RawFramebufferFormat::RmppBgra32Padded => {
+                unreachable!("Paper Pro conversion is checked by rmpp_fallback_drops_row_padding_and_swaps_bgra")
             }
             RawFramebufferFormat::Rm2Bgra32 => {
                 let processed: Vec<u8> = raw_data.chunks_exact(4).map(|pixel| pixel[0]).collect();
@@ -1133,9 +1140,7 @@ mod tests {
         assert_eq!(direct.dimensions(), legacy.dimensions());
         assert_eq!(direct.color(), legacy.color());
         match format {
-            RawFramebufferFormat::RmppRgba8 => {
-                assert_eq!(direct.to_rgba8().into_raw(), legacy.to_rgba8().into_raw());
-            }
+            RawFramebufferFormat::RmppBgra32Padded => unreachable!(),
             _ => {
                 assert_eq!(direct.to_luma8().into_raw(), legacy.to_luma8().into_raw());
             }
@@ -1143,17 +1148,23 @@ mod tests {
     }
 
     #[test]
-    fn rmpp_direct_frame_conversion_matches_legacy_png_roundtrip() {
-        let mut raw = vec![0u8; (RMPP_WIDTH * RMPP_HEIGHT * 4) as usize];
-        for (x, y, rgba) in [
-            (0, 0, [1, 2, 3, 4]),
-            (RMPP_WIDTH / 2, RMPP_HEIGHT / 2, [17, 89, 201, 255]),
-            (RMPP_WIDTH - 1, RMPP_HEIGHT - 1, [255, 128, 64, 32]),
-        ] {
-            let offset = ((y * RMPP_WIDTH + x) * 4) as usize;
-            raw[offset..offset + 4].copy_from_slice(&rgba);
-        }
-        assert_matches_legacy_roundtrip(raw, RawFramebufferFormat::RmppRgba8);
+    fn rmpp_fallback_drops_row_padding_and_swaps_bgra() {
+        let stride = (RMPP_STRIDE_PIXELS * 4) as usize;
+        let mut raw = vec![0u8; stride * RMPP_HEIGHT as usize];
+        let mut put = |x: u32, y: u32, bgra: [u8; 4]| {
+            let offset = y as usize * stride + x as usize * 4;
+            raw[offset..offset + 4].copy_from_slice(&bgra);
+        };
+        put(0, 0, [1, 2, 3, 0]);
+        put(RMPP_WIDTH - 1, RMPP_HEIGHT - 1, [201, 89, 17, 0]);
+        // Row padding must not leak into the image.
+        put(RMPP_WIDTH, 0, [9, 9, 9, 9]);
+        let image = Screenshot::image_from_raw_framebuffer(raw, RawFramebufferFormat::RmppBgra32Padded).unwrap();
+        assert_eq!(image.dimensions(), (RMPP_WIDTH, RMPP_HEIGHT));
+        let rgba = image.to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0).0, [3, 2, 1, 255]);
+        assert_eq!(rgba.get_pixel(1, 0).0, [0, 0, 0, 255]);
+        assert_eq!(rgba.get_pixel(RMPP_WIDTH - 1, RMPP_HEIGHT - 1).0, [17, 89, 201, 255]);
     }
 
     #[test]

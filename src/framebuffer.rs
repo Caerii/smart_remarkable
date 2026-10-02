@@ -31,7 +31,8 @@ fn config(text: &str) -> Result<Config> {
     Ok(Config { address, width, height, stride })
 }
 
-fn packed_rgba(raw: &[u8], width: usize, stride: usize) -> Result<Vec<u8>> {
+/// Drop row padding and convert BGRA scanout rows to opaque RGBA.
+pub(crate) fn packed_rgba(raw: &[u8], width: usize, stride: usize) -> Result<Vec<u8>> {
     ensure!(stride >= width * 4 && raw.len() % stride == 0, "Invalid framebuffer rows");
     let mut packed = Vec::with_capacity(raw.len() / stride * width * 4);
     for row in raw.chunks_exact(stride) {
