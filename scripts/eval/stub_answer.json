@@ -1,0 +1,353 @@
+{
+ "_label": "STUB MODEL RESPONSE - hand-written for the device-free evaluation; no model produced this.",
+ "lines": [
+  "7 + 3 = 10",
+  "",
+  "How to see it: start at 7 and count on three:",
+  "8, 9, 10. Each step adds one, so three steps",
+  "land on 10.",
+  "",
+  "Another way is to make a ten. 7 needs 3 more to reach 10, and that is exactly what you are adding, so the total is a whole ten with nothing left over.",
+  "",
+  "Check by subtracting: 10 - 3 = 7, which takes",
+  "you back to where you started.",
+  "",
+  "Related facts in the same family:",
+  "- 3 + 7 = 10 (order does not matter)",
+  "- 10 - 7 = 3",
+  "- 10 - 3 = 7",
+  "",
+  "Pairs that make ten are worth memorising,",
+  "because later sums lean on them:",
+  "- 1 + 9",
+  "- 2 + 8",
+  "- 3 + 7",
+  "- 4 + 6",
+  "- 5 + 5",
+  "",
+  "Try one: 7 + 5. Make ten first (7 + 3), then",
+  "add the 2 that remain: 12.",
+  "Try another: 8 + 6 = 8 + 2 + 4 = 14.",
+  "And one more: 9 + 4 = 9 + 1 + 3 = 13.",
+  "Number bonds to ten are a standard early",
+  "strategy; see [Khan Academy](https://www.khanacademy.org/math/cc-1st-grade-math) for practice.",
+  "The number line below shows the three hops."
+ ],
+ "illustrations": [
+  {
+   "title": "Number line: 7 + 3 = 10",
+   "strokes": [
+    [
+     {
+      "x": 30,
+      "y": 200
+     },
+     {
+      "x": 570,
+      "y": 200
+     }
+    ],
+    [
+     {
+      "x": 30,
+      "y": 190
+     },
+     {
+      "x": 30,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 84,
+      "y": 190
+     },
+     {
+      "x": 84,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 138,
+      "y": 190
+     },
+     {
+      "x": 138,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 192,
+      "y": 190
+     },
+     {
+      "x": 192,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 246,
+      "y": 190
+     },
+     {
+      "x": 246,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 300,
+      "y": 190
+     },
+     {
+      "x": 300,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 354,
+      "y": 190
+     },
+     {
+      "x": 354,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 408,
+      "y": 190
+     },
+     {
+      "x": 408,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 462,
+      "y": 190
+     },
+     {
+      "x": 462,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 516,
+      "y": 190
+     },
+     {
+      "x": 516,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 570,
+      "y": 190
+     },
+     {
+      "x": 570,
+      "y": 210
+     }
+    ],
+    [
+     {
+      "x": 408,
+      "y": 188
+     },
+     {
+      "x": 420,
+      "y": 160
+     },
+     {
+      "x": 435.0,
+      "y": 150
+     },
+     {
+      "x": 450,
+      "y": 160
+     },
+     {
+      "x": 462,
+      "y": 188
+     }
+    ],
+    [
+     {
+      "x": 454,
+      "y": 176
+     },
+     {
+      "x": 462,
+      "y": 188
+     },
+     {
+      "x": 468,
+      "y": 175
+     }
+    ],
+    [
+     {
+      "x": 462,
+      "y": 188
+     },
+     {
+      "x": 474,
+      "y": 160
+     },
+     {
+      "x": 489.0,
+      "y": 150
+     },
+     {
+      "x": 504,
+      "y": 160
+     },
+     {
+      "x": 516,
+      "y": 188
+     }
+    ],
+    [
+     {
+      "x": 508,
+      "y": 176
+     },
+     {
+      "x": 516,
+      "y": 188
+     },
+     {
+      "x": 522,
+      "y": 175
+     }
+    ],
+    [
+     {
+      "x": 516,
+      "y": 188
+     },
+     {
+      "x": 528,
+      "y": 160
+     },
+     {
+      "x": 543.0,
+      "y": 150
+     },
+     {
+      "x": 558,
+      "y": 160
+     },
+     {
+      "x": 570,
+      "y": 188
+     }
+    ],
+    [
+     {
+      "x": 562,
+      "y": 176
+     },
+     {
+      "x": 570,
+      "y": 188
+     },
+     {
+      "x": 576,
+      "y": 175
+     }
+    ]
+   ],
+   "labels": [
+    {
+     "x": 25,
+     "y": 235,
+     "text": "0"
+    },
+    {
+     "x": 79,
+     "y": 235,
+     "text": "1"
+    },
+    {
+     "x": 133,
+     "y": 235,
+     "text": "2"
+    },
+    {
+     "x": 187,
+     "y": 235,
+     "text": "3"
+    },
+    {
+     "x": 241,
+     "y": 235,
+     "text": "4"
+    },
+    {
+     "x": 295,
+     "y": 235,
+     "text": "5"
+    },
+    {
+     "x": 349,
+     "y": 235,
+     "text": "6"
+    },
+    {
+     "x": 403,
+     "y": 235,
+     "text": "7"
+    },
+    {
+     "x": 457,
+     "y": 235,
+     "text": "8"
+    },
+    {
+     "x": 511,
+     "y": 235,
+     "text": "9"
+    },
+    {
+     "x": 560,
+     "y": 235,
+     "text": "10"
+    },
+    {
+     "x": 425.0,
+     "y": 140,
+     "text": "+1"
+    },
+    {
+     "x": 479.0,
+     "y": 140,
+     "text": "+1"
+    },
+    {
+     "x": 533.0,
+     "y": 140,
+     "text": "+1"
+    },
+    {
+     "x": 380,
+     "y": 270,
+     "text": "start"
+    },
+    {
+     "x": 520,
+     "y": 270,
+     "text": "answer"
+    }
+   ]
+  }
+ ]
+}
