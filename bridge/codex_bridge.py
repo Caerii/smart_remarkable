@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import socket
 import subprocess
 import tempfile
 import textwrap
@@ -279,6 +281,15 @@ def run_codex(prompt, images, *, mode, model, timeout, executable):
 
 class Bridge(ThreadingHTTPServer):
     daemon_threads = True
+    if os.name == "nt":
+        # On Windows SO_REUSEADDR (HTTPServer's default) lets another process bind
+        # this same loopback port while we listen, and receive the tablet's bearer
+        # token. Claim the port exclusively instead. (Windows evaluation adaptation.)
+        allow_reuse_address = False
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
 
     def __init__(self, port, token, *, mode="text", model=None, timeout=360, executable="codex", runner=run_codex, backend_config=None):
         super().__init__(("127.0.0.1", port), Handler)
@@ -454,12 +465,17 @@ def main():
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--backend-config", type=Path)
     args = parser.parse_args()
-    if args.token_file.stat().st_mode & 0o077:
+    # POSIX mode bits are meaningless on Windows (st_mode is always 0o666 or 0o444);
+    # there the file's NTFS ACL, inherited from the user profile, governs access.
+    if os.name != "nt" and args.token_file.stat().st_mode & 0o077:
         parser.error("Token file must be private (chmod 600)")
     token = args.token_file.read_text().strip()
     if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
         parser.error("Token must be at least 32 ASCII characters with no whitespace")
-    server = Bridge(args.port, token, mode=args.mode, model=args.model, timeout=args.timeout, executable=args.codex,
+    # Resolve PATH shims (codex.cmd from a Node install on Windows); CreateProcess
+    # will not run a bare name that only exists as a .cmd file.
+    executable = shutil.which(args.codex) or args.codex
+    server = Bridge(args.port, token, mode=args.mode, model=args.model, timeout=args.timeout, executable=executable,
                     backend_config=args.backend_config)
     print(f"Codex bridge listening on 127.0.0.1:{server.server_port} ({args.mode})", flush=True)
     try:

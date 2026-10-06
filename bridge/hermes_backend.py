@@ -23,7 +23,9 @@ def parse_answer(text, mode):
 def run_hermes(prompt, images, *, mode, timeout, config):
     from codex_bridge import RequestError, format_answer_sources, validate_answer
     root = Path(config.get("agent_path", "")).expanduser()
-    executable = root / "venv/bin/python"
+    # A Windows venv keeps its interpreter in Scripts\python.exe; use it when present.
+    windows_python = root / "venv/Scripts/python.exe"
+    executable = windows_python if os.name == "nt" and windows_python.is_file() else root / "venv/bin/python"
     model = config.get("model")
     base_url = config.get("base_url", "http://127.0.0.1:8000/v1")
     parsed = urlsplit(base_url)
@@ -77,7 +79,12 @@ def run_hermes(prompt, images, *, mode, timeout, config):
         request.write_text(json.dumps({"content": content, "instructions": instructions, "model": model,
                                       "base_url": base_url, "timeout": timeout,
                                       "audit_path": str(audit), "omlx_settings": config.get("omlx_settings")}))
-        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR", "SHELL", "USER")}
+        keep = ("PATH", "HOME", "LANG", "TMPDIR", "SHELL", "USER")
+        if os.name == "nt":
+            # Python cannot start sockets/random on Windows without SYSTEMROOT.
+            keep += ("SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP", "USERPROFILE",
+                     "APPDATA", "LOCALAPPDATA", "PATHEXT", "COMSPEC", "USERNAME")
+        env = {k: v for k, v in os.environ.items() if k.upper() in keep}
         env.update(HERMES_HOME=str(home), HERMES_YOLO="1", PYTHONUNBUFFERED="1")
         try:
             result = run_agent([str(executable), str(Path(__file__).with_name("hermes_worker.py")),

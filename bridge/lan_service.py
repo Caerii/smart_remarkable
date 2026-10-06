@@ -3,7 +3,11 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows: no fcntl. Lock with msvcrt instead (evaluation adaptation).
+    fcntl = None
+    import msvcrt
 import json
 import os
 from pathlib import Path
@@ -27,6 +31,32 @@ PORT = 8765
 
 class Unavailable(Exception):
     pass
+
+
+def ssh_executable():
+    """The OpenSSH client to use. REMARKABLE_SSH_BIN overrides it.
+
+    The supervisor multiplexes one connection through a ControlMaster socket
+    (-M/-S/-O). Windows' bundled OpenSSH (System32) cannot do that: it fails
+    with "getsockname failed: Bad file descriptor". Git for Windows ships an
+    MSYS OpenSSH that can, so on Windows prefer it when PATH finds System32's.
+    (Windows evaluation adaptation; POSIX keeps plain "ssh".)
+    """
+    override = os.environ.get("REMARKABLE_SSH_BIN")
+    if override:
+        return override
+    if os.name != "nt":
+        return "ssh"
+    found = shutil.which("ssh") or ""
+    if "system32" not in found.lower():
+        return found or "ssh"
+    git = shutil.which("git")
+    candidates = [Path(git).resolve().parents[1] / "usr/bin/ssh.exe"] if git else []
+    candidates.append(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git/usr/bin/ssh.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise Unavailable("Windows OpenSSH cannot multiplex the tablet connection; install Git for Windows or set REMARKABLE_SSH_BIN")
 
 
 class Service:
@@ -59,9 +89,11 @@ class Service:
         self.mode = os.environ.get("REMARKABLE_RESPONSE_MODE", "ink")
         self.model = os.environ.get("REMARKABLE_CODEX_MODEL", "")
         self.codex = os.environ.get("REMARKABLE_CODEX_BIN") or shutil.which("codex")
-        self.domain = "gui/" + str(os.getuid())
+        # launchd domain; os.getuid does not exist on Windows (no launchd there either).
+        self.domain = "gui/" + str(os.getuid() if hasattr(os, "getuid") else 0)
         self.job = self.domain + "/" + self.label
         self.bridge_failures = 0
+        self.ssh_bin = ssh_executable()
         if self.mode not in ("ink", "text"):
             raise Unavailable("REMARKABLE_RESPONSE_MODE must be ink or text")
         # These paths enter SSH's remote shell and Unix-domain socket APIs.
@@ -91,7 +123,7 @@ class Service:
         return result.stdout.strip()
 
     def ssh(self, command, **kwargs):
-        return self.run(["ssh", "-S", str(self.socket), "-o", "BatchMode=yes",
+        return self.run([self.ssh_bin, "-S", str(self.socket), "-o", "BatchMode=yes",
                          "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
                          "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                          self.host, command], **kwargs)
@@ -100,8 +132,17 @@ class Service:
     def lock(self, name, blocking=True):
         with (self.runtime / name).open("a") as handle:
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                if fcntl:
+                    fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                else:
+                    handle.seek(0)
+                    # LK_LOCK retries for ~10 s and then raises; LK_NBLCK fails at once.
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
             except BlockingIOError:
+                raise Unavailable("The availability supervisor is already running") from None
+            except OSError:
+                if fcntl:
+                    raise
                 raise Unavailable("The availability supervisor is already running") from None
             yield
 
@@ -144,7 +185,13 @@ class Service:
             return None
         if pid <= 1:
             return None
-        command = self.run(["ps", "-p", str(pid), "-o", "command="]).stdout
+        if os.name == "nt":
+            # Windows has no `ps -o command=` (Git Bash's ps rejects -o, so stop
+            # silently left the bridge running). Read the command line via CIM.
+            command = self.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"]).stdout
+        else:
+            command = self.run(["ps", "-p", str(pid), "-o", "command="]).stdout
         return pid if str(self.repo / "bridge/codex_bridge.py") in command else None
 
     def ensure_bridge(self):
@@ -171,7 +218,11 @@ class Service:
             with socket.socket() as probe:
                 # Match HTTPServer's reuse policy so recent closed connections
                 # do not block a bridge reload while in TCP TIME_WAIT.
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if os.name == "nt":
+                    # Windows SO_REUSEADDR would succeed even over a live listener.
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                else:
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 probe.bind(("127.0.0.1", self.local_port))
         except OSError:
             raise Unavailable(f"Port {self.local_port} is occupied; leaving the other process alone") from None
@@ -195,16 +246,16 @@ class Service:
         raise Unavailable("Bridge failed to start; see tmp/lan-client/bridge.log")
 
     def tunnel_alive(self):
-        return self.run(["ssh", "-S", str(self.socket), "-O", "check", self.host]).returncode == 0
+        return self.run([self.ssh_bin, "-S", str(self.socket), "-O", "check", self.host]).returncode == 0
 
     def close_tunnel(self):
-        self.run(["ssh", "-S", str(self.socket), "-O", "exit", self.host])
+        self.run([self.ssh_bin, "-S", str(self.socket), "-O", "exit", self.host])
 
     def reap_stale_tunnel(self):
         # Use a fresh connection: the failed forward's old control socket cannot
         # be trusted. The tablet helper verifies our recorded process lifetime,
         # listening socket, and failed health check before terminating anything.
-        result = self.run(["ssh", "-S", "none", "-o", "BatchMode=yes",
+        result = self.run([self.ssh_bin, "-S", "none", "-o", "BatchMode=yes",
                            "-o", "ConnectTimeout=5", "-o", "ConnectionAttempts=1",
                            self.host, f"sh {REMOTE}/tunnel-owner.sh reap"])
         return result.returncode == 0
@@ -225,7 +276,7 @@ class Service:
 
     def ensure_tunnel_at_host(self):
         if not self.tunnel_alive():
-            command = ["ssh", "-M", "-S", str(self.socket), "-fNT",
+            command = [self.ssh_bin, "-M", "-S", str(self.socket), "-fNT",
                        "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                        "-o", "ConnectionAttempts=1", "-o", "ExitOnForwardFailure=yes",
                        "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",

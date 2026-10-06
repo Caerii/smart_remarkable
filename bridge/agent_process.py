@@ -3,23 +3,65 @@ import os
 import signal
 import subprocess
 
+# Windows has no POSIX process groups: os.killpg does not exist and
+# start_new_session is ignored, and `taskkill /T` misses descendants whose
+# parent already exited (uv's python.exe is such a trampoline). A Job Object is
+# the Windows equivalent: the agent starts suspended, joins a job, then resumes,
+# so every descendant is in the job before it can run, and TerminateJobObject
+# ends them all. (Windows adaptation for the evaluation; POSIX path unchanged.)
+_WINDOWS = os.name == "nt"
+if _WINDOWS:
+    import ctypes
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    _kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    _kernel32.TerminateJobObject.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    _kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    _ntdll = ctypes.WinDLL("ntdll")
+    _ntdll.NtResumeProcess.argtypes = (ctypes.c_void_p,)
+    _CREATE_SUSPENDED = 0x00000004
+
+
+def _start(command, kwargs):
+    if not _WINDOWS:
+        return subprocess.Popen(command, start_new_session=True, **kwargs), None
+    flags = kwargs.pop("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP | _CREATE_SUSPENDED
+    process = subprocess.Popen(command, creationflags=flags, **kwargs)
+    job = _kernel32.CreateJobObjectW(None, None)
+    if not job or not _kernel32.AssignProcessToJobObject(job, int(process._handle)):
+        process.kill()
+        raise OSError("Could not contain the agent process in a job object")
+    _ntdll.NtResumeProcess(int(process._handle))
+    return process, job
+
+
+def _kill_tree(process, job):
+    if job:
+        _kernel32.TerminateJobObject(job, 1)
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
 
 def run_agent(command, *, timeout, input=None, text=True, **kwargs):
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE, text=text, start_new_session=True,
-                          **kwargs) as process:
-        try:
-            stdout, stderr = process.communicate(input, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill the entire request process group before considering fallback.
-            # CLI tools can otherwise keep acting after their parent times out.
+    process, job = _start(command, dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=text, **kwargs))
+    try:
+        with process:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = process.communicate()
-            raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from None
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the entire request process group before considering fallback.
+                # CLI tools can otherwise keep acting after their parent times out.
+                _kill_tree(process, job)
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from None
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    finally:
+        if job:
+            _kernel32.CloseHandle(job)
 
 
 def read_only_events(output, provider):
